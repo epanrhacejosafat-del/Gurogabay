@@ -7,7 +7,11 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.gurogabaysteam.GuroGabay",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -15,7 +19,8 @@
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
-      }
+      },
+      "package": "com.gurogabaysteam.GuroGabay"
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -25,6 +30,18 @@
         "projectId": "f26bb5ab-66cc-45fa-8c8c-226c28c09dc3"
       }
     },
-    "owner": "gurogabays-team"
+    "owner": "gurogabays-team",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/f26bb5ab-66cc-45fa-8c8c-226c28c09dc3"
+    },
+    "plugins": [
+      "expo-sharing",
+      "expo-font",
+      "expo-status-bar",
+      "expo-asset"
+    ]
   }
 }

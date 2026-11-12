@@ -5,6 +5,8 @@
 
 const S = 3;            // sampling pixels per point on the straightened sheet
 const FILLED = 0.33;    // share of dark pixels that counts as a filled bubble
+const FAINT = 0.2;      // lighter than FILLED but darker than this = not fully shaded
+const STRAY = 0.15;     // dark share of the ring just outside a bubble that counts as a mark outside the circle
 const THR = 130;        // darker than this (after lighting fix) counts as ink when finding stripes
 const AREA = 0.75;      // how rectangle-like a stripe must be
 const SIZES = { 25: [30, 15], 30: [60, 20], 35: [100, 25] }; // stripes per side -> [questions, rows]
@@ -214,6 +216,23 @@ function classify(fr) {
   return [Math.max(...fr) > 0.2 ? 'faint' : 'blank', []];
 }
 
+// Looks at all the bubbles of one question and decides what the student did.
+// Anything that is not a single, clearly shaded bubble comes back with a reason and a suggestion so the teacher can confirm it.
+const isCross = (p) => Math.min(p.d1, p.d2) >= 0.2 && p.off <= 0.08 && p.fill >= 0.06 && p.fill <= 0.6;
+function judge(ps, choices) {
+  const f = ps.map((p) => p.fill);
+  const on = []; f.forEach((v, i) => { if (v > FILLED) on.push(i); });
+  const best = f.indexOf(Math.max(...f));
+  const out = (status, idx, reason) => ({ status, on: status === 'multiple' ? on : [], suggest: idx === null ? null : choices[idx], reason });
+  if (on.length === 1 && !isCross(ps[on[0]])) return { status: 'ok', on, suggest: null, reason: '' };
+  if (on.length === 1) return out('cross', on[0], 'Cross mark instead of shading');
+  if (on.length > 1) return out('multiple', best, 'More than one bubble is shaded');
+  const cross = ps.findIndex(isCross);
+  if (cross >= 0) return out('cross', cross, 'Cross mark instead of shading');
+  if (f[best] > FAINT) return out('faint', best, 'Not fully shaded');
+  return { status: 'blank', on: [], suggest: null, reason: '' };
+}
+
 function align(L, R, layouts) {
   const [n, rows] = SIZES[L.length];
   let gi = 0, gmax = -1;
@@ -251,24 +270,48 @@ export function readSheet(gray, w, h, layouts, isNorm) {
   const { n, lay, H } = found;
   const Hi = inv3(H);
 
-  const fill = (x, y, r) => {
-    const cx = Math.floor(x * S), cy = Math.floor(y * S), rr = Math.floor(r * S * 0.7);
-    let dark = 0, tot = 0;
+  // fill = dark share inside the bubble. d1 / d2 / off = dark share along each diagonal / everywhere else (a cross has ink only on the diagonals).
+  const probe = (x, y, r) => {
+    const cx = Math.floor(x * S), cy = Math.floor(y * S), rr = Math.floor(r * S * 0.7), band = Math.max(1, rr * 0.22);
+    let dark = 0, tot = 0, a1 = 0, n1 = 0, a2 = 0, n2 = 0, od = 0, ot = 0;
     for (let dy = -rr; dy <= rr; dy++) for (let dx = -rr; dx <= rr; dx++) {
       if (dx * dx + dy * dy > rr * rr) continue;
       const p = apply(Hi, cx + dx, cy + dy);
-      if (sample(norm, w, h, p[0], p[1]) < 140) dark++;
-      tot++;
+      const v = sample(norm, w, h, p[0], p[1]) < 140 ? 1 : 0;
+      tot++; dark += v;
+      const on1 = Math.abs(dx - dy) <= band, on2 = Math.abs(dx + dy) <= band;
+      if (on1) { n1++; a1 += v; }
+      if (on2) { n2++; a2 += v; }
+      if (!on1 && !on2) { ot++; od += v; }
     }
-    return dark / tot;
+    return { fill: dark / tot, d1: n1 ? a1 / n1 : 0, d2: n2 ? a2 / n2 : 0, off: ot ? od / ot : 0 };
   };
+  const fill = (x, y, r) => probe(x, y, r, true).fill;
   const a = lay.answers, per = {};
   for (const b of a.bubbles) (per[b.q] = per[b.q] || {})[b.choice] = [b.x, b.y];
+  // Looks at the space between the bubbles of one row. Ink there (not a tiny speck) means the student marked outside the circles.
+  const gapMark = (q) => {
+    const cs = a.choices, rowY = per[q][cs[0]][1], step = 2 / S; let best = null;
+    for (let k = 0; k < cs.length - 1; k++) {
+      const x0 = per[q][cs[k]][0] + a.radius * 1.2, x1 = per[q][cs[k + 1]][0] - a.radius * 1.2;
+      let dark = 0, tot = 0, sx = 0;
+      for (let yy = rowY - a.radius * 0.9; yy <= rowY + a.radius * 0.9; yy += step) for (let xx = x0; xx <= x1; xx += step) {
+        const p = apply(Hi, xx * S, yy * S); tot++;
+        if (sample(norm, w, h, p[0], p[1]) < 140) { dark++; sx += xx; }
+      }
+      if (tot && dark / tot >= STRAY && (!best || dark / tot > best.v)) best = { v: dark / tot, x: sx / dark };
+    }
+    if (!best) return null;
+    let near = cs[0], d = 1e9;
+    cs.forEach((c) => { const dd = Math.abs(per[q][c][0] - best.x); if (dd < d) { d = dd; near = c; } });
+    return near;
+  };
   const answers = [];
   for (let q = 1; q <= n; q++) {
-    const fr = a.choices.map((c) => fill(per[q][c][0], per[q][c][1], a.radius));
-    const [status, on] = classify(fr);
-    answers.push({ q, status, choice: on.map((k) => a.choices[k]) });
+    const ps = a.choices.map((c) => probe(per[q][c][0], per[q][c][1], a.radius));
+    const j = judge(ps, a.choices);
+    if (j.status === 'blank') { const s2 = gapMark(q); if (s2) { j.status = 'stray'; j.suggest = s2; j.reason = 'Mark outside the bubble'; } }
+    answers.push({ q, status: j.status, choice: j.on.map((k) => a.choices[k]), suggest: j.suggest, reason: j.reason });
   }
   const id = lay.id; let studentId = '';
   for (let j = 0; j < id.cols; j++) {
@@ -277,27 +320,9 @@ export function readSheet(gray, w, h, layouts, isNorm) {
     const [st, on] = classify(fr);
     if (st === 'ok') studentId += on[0]; else if (st !== 'blank') studentId += '?';
   }
-  return { n, answers, studentId, reviewUri: reviewImage(norm, w, h, Hi, lay, answers, per) };
+  return { n, answers, studentId, reviewUri: scanImage(norm, w, h, Hi, lay) };
 }
 
-// ---------- review picture (straightened sheet with rings), as a PNG data URI ----------
-function reviewImage(norm, w, h, Hi, lay, answers, per) {
-  const pw = Math.round(lay.page[0] * RS), ph = Math.round(lay.page[1] * RS);
-  const px = new Uint8Array(pw * ph);
-  for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++) {
-    const p = apply(Hi, (x / RS) * S, (y / RS) * S);
-    px[y * pw + x] = Math.min(250, (sample(norm, w, h, p[0], p[1]) * 250) / 255);
-  }
-  const ring = (cx, cy, rad, idx) => {
-    const c = Math.round(cx * RS), d = Math.round(cy * RS), R = rad * RS;
-    for (let y = Math.floor(d - R - 2); y <= d + R + 2; y++) for (let x = Math.floor(c - R - 2); x <= c + R + 2; x++) {
-      if (x < 0 || y < 0 || x >= pw || y >= ph) continue;
-      const dist = Math.hypot(x - c, y - d);
-      if (dist >= R - 1 && dist <= R + 1) px[y * pw + x] = idx;
-    }
-  };
-  return 'data:image/png;base64,' + toBase64(pngIndexed(px, pw, ph));
-}
 const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
 function crc32(b) { let c = 0xffffffff; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
 function pngIndexed(px, w, h) {
@@ -326,6 +351,64 @@ function pngIndexed(px, w, h) {
   const parts = [Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('PLTE', pal), chunk('IDAT', z), chunk('IEND', new Uint8Array(0))];
   const res = new Uint8Array(parts.reduce((s, p) => s + p.length, 0)); let q = 0;
   for (const p of parts) { res.set(p, q); q += p.length; }
+  return res;
+}
+
+// ---------- the scanned sheet, straightened, as a small PNG ----------
+// 4 gray shades and real compression keep it near 30 KB, so every scanned paper can be kept and shown again.
+const SCAN_RS = 1.25; // pixels per point of the printed sheet
+function scanImage(norm, w, h, Hi, lay) {
+  const pw = Math.round(lay.page[0] * SCAN_RS), ph = Math.round(lay.page[1] * SCAN_RS);
+  const px = new Uint8Array(pw * ph);
+  for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++) {
+    const p = apply(Hi, (x / SCAN_RS) * S, (y / SCAN_RS) * S);
+    px[y * pw + x] = Math.max(0, Math.min(255, sample(norm, w, h, p[0], p[1])));
+  }
+  return 'data:image/png;base64,' + toBase64(pngGray2(px, pw, ph));
+}
+// Deflate with one fixed-Huffman block. Runs of equal bytes (the blank paper) become single matches.
+function deflateFixed(raw) {
+  const out = []; let buf = 0, cnt = 0;
+  const put = (v, n) => { buf |= v << cnt; cnt += n; while (cnt >= 8) { out.push(buf & 255); buf >>>= 8; cnt -= 8; } };
+  const code = (c, n) => { let r = 0; for (let i = 0; i < n; i++) r |= ((c >> i) & 1) << (n - 1 - i); put(r, n); }; // Huffman codes are sent most significant bit first
+  const lit = (v) => { if (v < 144) code(0x30 + v, 8); else code(0x190 + v - 144, 9); };
+  const sym = (s2) => { if (s2 < 256) lit(s2); else if (s2 < 280) code(s2 - 256, 7); else code(0xc0 + s2 - 280, 8); };
+  const LB = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+  const LE = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+  put(1, 1); put(1, 2);
+  for (let i = 0, n = raw.length; i < n;) {
+    const v = raw[i]; let run = 1; while (i + run < n && raw[i + run] === v && run < 259) run++;
+    lit(v);
+    if (run >= 4) { const len = run - 1; let k = LB.length - 1; while (LB[k] > len) k--; sym(257 + k); if (LE[k]) put(len - LB[k], LE[k]); code(0, 5); i += run; } else i++;
+  }
+  sym(256); if (cnt > 0) out.push(buf & 255);
+  return Uint8Array.from(out);
+}
+// 2-bit grayscale PNG. Each row is stored as the difference from the row above, so blank areas become zeros.
+function pngGray2(px, w, h) {
+  const rowBytes = Math.ceil(w / 4), line = new Uint8Array(rowBytes), prev = new Uint8Array(rowBytes), raw = new Uint8Array((rowBytes + 1) * h);
+  for (let y = 0; y < h; y++) {
+    line.fill(0);
+    for (let x = 0; x < w; x++) { const v = px[y * w + x], q = v < 100 ? 0 : v < 150 ? 1 : v < 200 ? 2 : 3; line[x >> 2] |= q << (6 - 2 * (x & 3)); }
+    const o = y * (rowBytes + 1); raw[o] = 2;
+    for (let i = 0; i < rowBytes; i++) raw[o + 1 + i] = (line[i] - prev[i]) & 255;
+    prev.set(line);
+  }
+  let a = 1, b = 0;
+  for (let i = 0; i < raw.length; i++) { a = (a + raw[i]) % 65521; b = (b + a) % 65521; }
+  const d = deflateFixed(raw), z = new Uint8Array(2 + d.length + 4);
+  z[0] = 0x78; z[1] = 0x01; z.set(d, 2);
+  const ad = ((b << 16) | a) >>> 0, e = 2 + d.length; z[e] = ad >>> 24; z[e + 1] = (ad >>> 16) & 255; z[e + 2] = (ad >>> 8) & 255; z[e + 3] = ad & 255;
+  const chunk = (type, data) => {
+    const o2 = new Uint8Array(12 + data.length), dv = new DataView(o2.buffer);
+    dv.setUint32(0, data.length); for (let i = 0; i < 4; i++) o2[4 + i] = type.charCodeAt(i);
+    o2.set(data, 8); dv.setUint32(8 + data.length, crc32(o2.subarray(4, 8 + data.length))); return o2;
+  };
+  const ihdr = new Uint8Array(13), dv = new DataView(ihdr.buffer);
+  dv.setUint32(0, w); dv.setUint32(4, h); ihdr[8] = 2; ihdr[9] = 0;
+  const parts = [Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', z), chunk('IEND', new Uint8Array(0))];
+  const res = new Uint8Array(parts.reduce((s2, p2) => s2 + p2.length, 0)); let q = 0;
+  for (const p2 of parts) { res.set(p2, q); q += p2.length; }
   return res;
 }
 

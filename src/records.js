@@ -52,9 +52,9 @@ function component(hps, sc, weight) {
 }
 
 // One learner's term result. hps = {ww:[10], pt:[10], ex:[3]}, sc = same shape.
-export function termCalc(trackKey, hps, sc) {
+export function termCalc(trackKey, hps, sc, custom) {
   const t = TRACKS.find((x) => x.k === trackKey) || TRACKS[0];
-  const [wW, wP, wE] = t.w;
+  const [wW, wP, wE] = Array.isArray(custom) && custom.length === 3 ? custom : t.w; // custom = teacher's own weights as fractions
   const ww = component(hps.ww, sc.ww, wW);
   const pt = component(hps.pt, sc.pt, wP);
   let exWs = 0; let exAny = false;
@@ -93,7 +93,7 @@ export function levelOf(pct) {
 export function individualScores(z) {
   const rows = z.res.map((r) => {
     const marks = z.key.map((k, i) => (r.ans[i] === LET[k] ? 1 : 0));
-    return { id: r.id, name: r.name, marks, total: sum(marks) };
+    return { uid: r.uid, id: r.id, name: r.name, marks, total: sum(marks) };
   }).sort((a, b) => a.name.localeCompare(b.name));
   const cases = rows.length;
   const correct = z.key.map((_, i) => sum(rows.map((r) => r.marks[i])));
@@ -112,3 +112,124 @@ export function mpsSummary(totals, hps) {
 // ---------------- CSV ----------------
 const cell = (v) => { const s = v === null || v === undefined ? '' : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
 export const csv = (rows) => rows.map((r) => r.map(cell).join(',')).join('\n');
+
+// ---------------- CSV layouts of the MPS workbook ----------------
+// A quiz can be given to several classes. Each class is one "section"; papers whose student is in no class go to "No class".
+export function quizSections(z, classes) {
+  const rows = individualScores(z).rows;
+  const cls = (z.c || []).map((id) => classes.find((c) => c.id === id)).filter(Boolean);
+  if (!cls.length) return [{ name: z.n, rows }];
+  const secs = cls.map((c) => ({ name: c.n, rows: [] })); const loose = [];
+  rows.forEach((r) => { const i = cls.findIndex((c) => r.id && c.s.includes(r.id)); (i >= 0 ? secs[i].rows : loose).push(r); });
+  const out = secs.filter((s) => s.rows.length); if (loose.length) out.push({ name: 'No class', rows: loose });
+  return out.length ? out : [{ name: z.n, rows: [] }];
+}
+
+// "individual score" sheet: A = number, B = learner, C = total, then one 1/0 column per item. The section name sits in B of the header row.
+export function individualCsvRows(z, sections) {
+  const out = [];
+  sections.forEach((s, k) => {
+    if (k) out.push([]);
+    out.push(['', s.name, '', ...z.key.map((_, i) => i + 1)]);
+    s.rows.forEach((r, i) => out.push([i + 1, r.name, r.total, ...r.marks]));
+  });
+  return out;
+}
+
+// "MPS Computation" sheet: sections side by side, 4 columns each (number, learner, score, spacer), up to 5 per band,
+// then Cases / HPS / HSO / LSO / Mean / MPS and the five proficiency bands with their percentages.
+const BAND_LABELS = ['0-24', '25-49', '50-74', '75-89', '90-100'];
+export function mpsCsvRows(z, sections) {
+  const out = []; const hps = z.f;
+  for (let b = 0; b < sections.length; b += 5) {
+    const band = sections.slice(b, b + 5); const most = Math.max(0, ...band.map((s) => s.rows.length));
+    const stats = band.map((s) => mpsSummary(s.rows.map((r) => r.total), hps));
+    const line = (fn) => band.flatMap((s, i) => fn(s, i));
+    if (b) out.push([]);
+    out.push(line((s, i) => [b === 0 && i === 0 ? 'Sec' : '', s.name, 'Score', '']));
+    for (let i = 0; i < most; i++) out.push(line((s) => { const r = s.rows[i]; return r ? [i + 1, r.name, r.total, ''] : [i + 1, '', '', '']; }));
+    const stat = (label, get) => out.push(line((s, i) => ['', label, stats[i] ? get(stats[i]) : '', '']));
+    stat('Cases', (m) => m.cases); stat('HPS', () => hps); stat('HSO', (m) => m.hso); stat('LSO', (m) => m.lso);
+    stat('Mean', (m) => m.mean.toFixed(2)); stat('MPS', (m) => m.mps.toFixed(2));
+    LEVELS.forEach((lv, k) => {
+      stat(BAND_LABELS[k], (m) => m.bands[lv.k]);
+      stat('%', (m) => ((m.bands[lv.k] / m.cases) * 100).toFixed(2));
+    });
+  }
+  return out;
+}
+
+// ---------------- Table of specification (TOS) and competency analysis ----------------
+export const TOS_LEVELS = ['Remembering', 'Understanding', 'Applying', 'Analyzing', 'Evaluating', 'Creating'];
+export const MASTERY = 75; // percent of correct answers on a competency that counts as mastered
+
+// "1-4, 12, 17-19, 22" -> { items: [1,2,3,4,12,17,18,19,22], bad: [] }. Accepts hyphens, en dashes and "to"; items outside 1..max are reported.
+export function parseItems(text, max) {
+  const items = new Set(); const bad = [];
+  String(text || '').split(/[,;\n]+/).map((t) => t.trim().replace(/\s*(?:to|[\u2013\u2014\u2212-])\s*/gi, '-')).filter(Boolean).forEach((tok) => {
+    const m = /^(\d+)(?:-(\d+))?$/.exec(tok);
+    if (!m) { bad.push(tok); return; }
+    const a = Number(m[1]); const b = m[2] === undefined ? a : Number(m[2]);
+    if (a < 1 || b < a || b > max) { bad.push(tok); return; }
+    for (let i = a; i <= b; i++) items.add(i);
+  });
+  return { items: [...items].sort((x, y) => x - y), bad };
+}
+// [1,2,3,4,12,17,18,19,22] -> "1-4, 12, 17-19, 22"
+export function itemsText(items) {
+  const out = []; let i = 0;
+  while (i < items.length) { let j = i; while (j + 1 < items.length && items[j + 1] === items[j] + 1) j++; out.push(j - i >= 2 ? items[i] + '-' + items[j] : items.slice(i, j + 1).join(', ')); i = j + 1; }
+  return out.join(', ');
+}
+// Problems with a TOS: items used by two competencies, items no competency covers, level counts that do not add up.
+export function tosCheck(z) {
+  const comps = (z.tos && z.tos.comps) || []; const owner = {}; const dup = new Set();
+  comps.forEach((c, k) => c.items.forEach((it) => { if (owner[it] !== undefined && owner[it] !== k) dup.add(it); else owner[it] = k; }));
+  const missing = []; for (let i = 1; i <= z.f; i++) if (owner[i] === undefined) missing.push(i);
+  const levelMismatch = comps.map((c, k) => (c.lv && c.lv.some((v) => v) && sum(c.lv) !== c.items.length ? k : -1)).filter((k) => k >= 0);
+  const lv = TOS_LEVELS.map((_, i) => sum(comps.map((c) => (c.lv && c.lv[i]) || 0)));
+  return { dup: [...dup].sort((a, b) => a - b), missing, levelMismatch, lv, easy: lv[0] + lv[1], average: lv[2] + lv[3], difficult: lv[4] + lv[5], total: sum(comps.map((c) => c.items.length)) };
+}
+
+// Mastery of each competency from the scanned papers, lowest first.
+export function competencyStats(z) {
+  const comps = (z.tos && z.tos.comps) || []; const d = individualScores(z); const cases = d.cases;
+  if (!comps.length || !cases) return [];
+  return comps.map((c, k) => {
+    const items = c.items.map((it) => {
+      const wrong = {}; z.res.forEach((r) => { const m = r.ans[it - 1] || '-'; if (m !== LET[z.key[it - 1]]) wrong[m] = (wrong[m] || 0) + 1; });
+      const top = Object.keys(wrong).sort((a, b) => wrong[b] - wrong[a])[0];
+      return { item: it, pct: d.pct[it - 1], correct: d.correct[it - 1], wrongTop: top ? { l: top, n: wrong[top] } : null };
+    });
+    const correct = sum(items.map((x) => x.correct)); const pct = (correct / (items.length * cases)) * 100;
+    const learners = d.rows.map((r) => { const got = sum(c.items.map((it) => r.marks[it - 1])); return { uid: r.uid, name: r.name, pct: (got / items.length) * 100 }; })
+      .filter((x) => x.pct < MASTERY).sort((a, b) => a.pct - b.pct);
+    return { k, name: c.n, items, itemsText: itemsText(c.items), count: items.length, correct, cases, pct, level: levelOf(pct), mastered: pct >= MASTERY, learners };
+  }).sort((a, b) => a.pct - b.pct);
+}
+
+// Same layout as the TOS on paper: competency, number of items, weight, levels of thinking, item placement, total row.
+export function tosCsvRows(z) {
+  const comps = (z.tos && z.tos.comps) || []; const chk = tosCheck(z);
+  const pct = (n) => (z.f ? ((n / z.f) * 100).toFixed(1) + '%' : '');
+  return [
+    ['Table of Specifications', z.n], [],
+    ['Objectives / Learning Competencies', 'No. of Items', 'Weight', ...TOS_LEVELS, 'Item Placement'],
+    ...comps.map((c, i) => [(i + 1) + '. ' + c.n, c.items.length, pct(c.items.length), ...TOS_LEVELS.map((_, l) => (c.lv ? c.lv[l] || 0 : '')), itemsText(c.items)]),
+    ['TOTAL', chk.total, pct(chk.total), chk.easy + ' (' + pct(chk.easy) + ') EASY', '', chk.average + ' (' + pct(chk.average) + ') AVERAGE', '', chk.difficult + ' (' + pct(chk.difficult) + ') DIFFICULT', '', '1-' + z.f],
+  ];
+}
+// Like the CR&LP sheet: correct responses and percent mastery per section, then overall.
+export function competencyCsvRows(z, sections) {
+  const stats = competencyStats(z); const head = ['Learning competency', 'Item placement', 'No. of items'];
+  const secCols = sections.flatMap((s) => [s.name + ' correct', s.name + ' %']);
+  const out = [['Competency analysis', z.n], [], [...head, ...secCols, 'Total correct', 'Cases', '% mastery', 'Level', 'Remark']];
+  stats.forEach((c) => {
+    const per = sections.flatMap((s) => {
+      const got = sum(c.items.map((x) => sum(s.rows.map((r) => r.marks[x.item - 1])))); const den = c.count * s.rows.length;
+      return [got, den ? ((got / den) * 100).toFixed(2) : ''];
+    });
+    out.push([c.name, c.itemsText, c.count, ...per, c.correct, c.cases, c.pct.toFixed(2), c.level.n, c.mastered ? 'Mastered' : 'Needs reteaching']);
+  });
+  return out;
+}
