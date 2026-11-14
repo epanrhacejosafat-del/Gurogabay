@@ -40,7 +40,7 @@ const thumbCache = new Map();
 const TOP = Platform.OS === 'ios' ? (Dimensions.get('window').height >= 800 ? 56 : 24) : (StatusBar.currentHeight || 28);
 const BOTTOM = Platform.OS === 'ios' ? 30 : 18;
 const AMBER = '#d99a00';
-const SCAN_PX = 1400; // longest side of the photo that gets read. Lower = faster, higher = more accurate
+const SCAN_PX = 1200; // longest side of the photo that gets read. Lower = faster, higher = more accurate
 const A4 = 595 / 842;
 const LET = ['A', 'B', 'C', 'D', 'E'];
 // The scanner reads three printed sheet forms. A quiz of any size from 1 to 100 uses the smallest form that fits it.
@@ -223,11 +223,12 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
     setErr(''); setNote(''); setPhase('busy');
     try {
       const t0 = Date.now();
-      const pic = await cam.current.takePictureAsync({ quality: 0.8, skipProcessing: true, shutterSound: false });
+      const pic = await cam.current.takePictureAsync({ quality: 0.6, skipProcessing: true, shutterSound: false });
       const k = SCAN_PX / Math.max(pic.width, pic.height);
-      const small = await manipulateAsync(pic.uri, [{ resize: { width: Math.round(pic.width * k) } }], { compress: 0.8, format: SaveFormat.JPEG, base64: true });
-      await new Promise((r) => setTimeout(r, 150)); // let the "Reading" message show before the heavy work
-      const raw = jpeg.decode(fromBase64(small.base64), { useTArray: true });
+      const small = await manipulateAsync(pic.uri, [{ resize: { width: Math.round(pic.width * k) } }], { compress: 0.7, format: SaveFormat.JPEG });
+      await new Promise((r) => setTimeout(r, 0)); // let the "Reading" message show before the heavy work
+      const buf = await (await fetch(small.uri)).arrayBuffer();
+      const raw = jpeg.decode(new Uint8Array(buf), { useTArray: true });
       const out = readPhoto(rgbaToGray(raw.data, raw.width, raw.height), raw.width, raw.height, LAYOUTS);
       if (out.n !== formOf(z)) throw new ScanError(`This is a ${out.n}-question sheet, but this quiz needs the ${formOf(z)}-question sheet.`);
       if (out.answers.length > z.f) out.answers = out.answers.slice(0, z.f);

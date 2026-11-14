@@ -53,14 +53,28 @@ function boxBlur(a, w, h, r) {
   }
 }
 function normalize(gray, w, h) {
+  // The paper brightness is smooth, so it is estimated on a 1/3-size copy and scaled back up (about 9x less work).
   const k = (Math.floor(0.02 * Math.max(w, h))) | 1, r = (k - 1) >> 1;
-  const closed = morph(morph(gray, w, h, r, true), w, h, r, false);
-  const bg = Float32Array.from(closed);
-  for (let i = 0; i < 3; i++) boxBlur(bg, w, h, r);
+  const f = 3, sw = Math.ceil(w / f), sh = Math.ceil(h / f), rs = Math.max(1, Math.round(r / f));
+  const small = new Uint8Array(sw * sh);
+  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
+    let m = 0;
+    for (let dy = 0; dy < f && y * f + dy < h; dy++) for (let dx = 0; dx < f && x * f + dx < w; dx++) {
+      const v = gray[(y * f + dy) * w + x * f + dx]; if (v > m) m = v;
+    }
+    small[y * sw + x] = m;
+  }
+  const bg = Float32Array.from(morph(morph(small, sw, sh, rs, true), sw, sh, rs, false));
+  for (let i = 0; i < 3; i++) boxBlur(bg, sw, sh, rs);
   const norm = new Uint8Array(w * h);
-  for (let i = 0; i < norm.length; i++) {
-    const v = (gray[i] / Math.max(bg[i], 1)) * 255;
-    norm[i] = v > 255 ? 255 : v;
+  for (let y = 0; y < h; y++) {
+    const fy = Math.min(sh - 1.001, y / f), y0 = fy | 0, ty = fy - y0;
+    for (let x = 0; x < w; x++) {
+      const fx = Math.min(sw - 1.001, x / f), x0 = fx | 0, tx = fx - x0, i = y0 * sw + x0;
+      const bv = (bg[i] * (1 - tx) + bg[i + 1] * tx) * (1 - ty) + (bg[i + sw] * (1 - tx) + bg[i + sw + 1] * tx) * ty;
+      const v = (gray[y * w + x] / Math.max(bv, 1)) * 255;
+      norm[y * w + x] = v > 255 ? 255 : v;
+    }
   }
   return norm;
 }

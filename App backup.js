@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { View, Text, TextInput, Pressable, ScrollView, Modal, StyleSheet, Switch, Alert, Share, Image,
-  ActivityIndicator, useColorScheme, Platform, StatusBar, KeyboardAvoidingView, BackHandler, Dimensions } from 'react-native';
+import { View, Text, TextInput, ScrollView, Modal, StyleSheet, Switch, Alert, Share, Image,
+  ActivityIndicator, useColorScheme, Platform, StatusBar, KeyboardAvoidingView, BackHandler, Dimensions, Linking } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { AppState } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { Ionicons } from '@expo/vector-icons';
@@ -11,7 +12,16 @@ import { TRACKS, NCOL, termCalc, finalCalc, individualScores, mpsSummary, LEVELS
 import * as FS from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import { supabase } from './lib/supabase';
+import { syncNow, markSaved } from './lib/sync';
+import { checkStudent, studentConflict } from './lib/duplicates';
 import { importTos } from './src/tosImport';
+import SettingsPanel from './SettingsPanel';
+import CreditsPanel from './CreditsPanel';
+import SplashAnimation from './SplashAnimation';
+import Pressable from './PressableScale';
+import Animated, { FadeInRight, Easing, runOnJS, useSharedValue, useAnimatedStyle, withTiming } from 'react-native-reanimated';
+
+
 
 // Remembers the "Stay signed in on this phone" switch.
 const STAY_KEY = 'gurogabay:stay';
@@ -33,6 +43,13 @@ const AMBER = '#d99a00';
 const SCAN_PX = 1400; // longest side of the photo that gets read. Lower = faster, higher = more accurate
 const A4 = 595 / 842;
 const LET = ['A', 'B', 'C', 'D', 'E'];
+// The scanner reads three printed sheet forms. A quiz of any size from 1 to 100 uses the smallest form that fits it.
+const FORMS = [30, 60, 100];
+const formOf = (z) => FORMS.find((n) => n >= z.f) || 100;
+const CHOICE_NAMES = { AB: 'A – B', AC: 'A – C', AD: 'A – D', AE: 'A – E', TF: 'True / False' };
+const CHOICE_N = { AB: 2, AC: 3, AD: 4, AE: 5, TF: 2 };
+const optsOf = (z) => LET.slice(0, CHOICE_N[z.ch] || 5);
+const showL = (z, l) => (z.ch === 'TF' ? (l === 'A' ? 'T' : l === 'B' ? 'F' : l) : l);
 const PAL = ['#f0c24b', '#7fb59a', '#e08e79', '#8aa6d6', '#b99ad0'];
 const LIGHT = { bg: '#eceee9', card: '#ffffff', ink: '#1d2b3a', mute: '#66727e', red: '#e5342d', green: '#0a9d58' };
 const DARK = { bg: '#161c22', card: '#212a33', ink: '#eef1f3', mute: '#9aa7b2', red: '#ff6b64', green: '#3ecf8e' };
@@ -40,20 +57,26 @@ const TITLES = { home: 'Quizzes', classes: 'Classes', sheet: 'Spreadsheet', rece
 const ICONS = { home: 'home-outline', classes: 'people-outline', sheet: 'document-text-outline', recent: 'time-outline' };
 const today = () => new Date().toLocaleDateString('en', { month: 'short', day: 'numeric' });
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-const EMPTY = { quizzes: [], classes: [], students: [], log: [], nextId: 1001, ecr: {} };
+const EMPTY = { quizzes: [], classes: [], students: [], log: [], nextId: 0, ecr: {} };
+// Student IDs are 4 digits, starting at 0000 (same as the website).
+const fmtId = (n) => String(n).padStart(4, '0');
 
 // Older saved data stored students as plain names or numeric ids. Student ids are text now so teachers can edit them.
 function migrate(d) {
   d = { ...EMPTY, ...d };
   d.ecr = d.ecr || {};
-  d.students.forEach((st) => { st.id = String(st.id); });
+  // drop students that have no real ID (they made two rows share the same key) and any repeated ID
+  const seenId = new Set();
+  d.students = d.students.filter((st) => { const i = st && st.id !== undefined && st.id !== null ? String(st.id).trim() : ''; if (!i || i === 'undefined' || i === 'null' || seenId.has(i)) return false; seenId.add(i); return true; });
+  d.students.forEach((st) => { st.id = String(st.id).trim(); });
+  if (!d.students.length) d.nextId = 0; // nobody registered yet: start again from 0000
   const ids = new Set(d.students.map((st) => st.id)); const byName = {};
   d.students.forEach((st) => { byName[st.name] = st; });
   d.classes.forEach((c) => {
     c.s = (c.s || []).map((x) => {
       if (typeof x === 'number') return String(x);
       if (ids.has(x)) return x;
-      if (!byName[x]) { const st = { id: String(d.nextId++), name: x }; d.students.push(st); byName[x] = st; ids.add(st.id); }
+      if (!byName[x]) { const st = { id: fmtId(d.nextId++), name: x }; d.students.push(st); byName[x] = st; ids.add(st.id); }
       return byName[x].id;
     });
   });
@@ -64,7 +87,7 @@ function migrate(d) {
   return d;
 }
 // A student id nobody uses yet.
-const freshId = (d) => { let id = String(d.nextId++); while (d.students.some((st) => st.id === id)) id = String(d.nextId++); return id; };
+const freshId = (d) => { let id = fmtId(d.nextId++); while (d.students.some((st) => st.id === id)) id = fmtId(d.nextId++); return id; };
 const scoreOf = (z, r) => z.key.reduce((n, k, i) => n + (r.ans[i] === LET[k] ? 1 : 0), 0);
 
 function Btn({ s, label, onPress, style, disabled }) {
@@ -83,7 +106,7 @@ function Bar({ s, onCancel, onSave, cancelLabel = 'CANCEL' }) {
 }
 function AddRow({ s, c, placeholder, onAdd }) {
   const [v, setV] = useState('');
-  const go = () => { if (v.trim()) { onAdd(v.trim()); setV(''); } };
+  const go = () => { if (v.trim()) { if (onAdd(v.trim()) !== false) setV(''); } };
   return (
     <View style={s.addrow}>
       <TextInput style={[s.input, { flex: 1, marginBottom: 0 }]} value={v} onChangeText={setV} placeholder={placeholder}
@@ -93,19 +116,25 @@ function AddRow({ s, c, placeholder, onAdd }) {
   );
 }
 
-function QuizForm({ s, c, classes, onSave, onCancel }) {
-  const [name, setName] = useState(''); const [f, setF] = useState(30);
+function QuizForm({ s, c, classes, quizzes, onSave, onCancel }) {
+  const [name, setName] = useState(''); const [fText, setFText] = useState('30'); const [ch, setCh] = useState('AE'); const [rec, setRec] = useState(null);
+  const f = Math.min(100, Math.max(1, parseInt(fText, 10) || 1));
   const [picked, setPicked] = useState([]); const [sh, setSh] = useState('');
   const tog = (id) => setPicked((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id]));
-  const save = () => (name.trim() ? onSave({ name: name.trim(), f, c: picked, sh: sh.trim() || name.trim() }) : Alert.alert('Enter a quiz name'));
+  const save = () => (name.trim() ? onSave({ name: name.trim(), f, ch, c: picked, sh: sh.trim() || name.trim(), rec: picked.length ? rec : null }) : Alert.alert('Enter a quiz name'));
   return (
     <View style={s.sheet}>
       <ScrollView keyboardShouldPersistTaps="handled">
         <Bar s={s} onCancel={onCancel} onSave={save} />
         <Text style={s.lab}>Name:</Text>
         <TextInput style={s.input} value={name} onChangeText={setName} placeholder="Quiz name" placeholderTextColor={c.mute} maxLength={40} />
-        <Text style={s.lab}>Answer sheet form:</Text>
-        <View style={s.chips}>{[30, 60, 100].map((n) => <Chip key={n} s={s} label={n + ' questions'} on={f === n} onPress={() => setF(n)} />)}</View>
+        <Text style={s.lab}>Number of questions (1 to 100):</Text>
+        <TextInput style={s.input} value={fText} keyboardType="number-pad" maxLength={3} placeholder="30" placeholderTextColor={c.mute}
+          onChangeText={(t) => { const d = t.replace(/\D/g, ''); setFText(d === '' ? '' : String(Math.min(100, parseInt(d, 10)))); }}
+          onBlur={() => setFText(String(f))} />
+        <Text style={s.lab}>Choices:</Text>
+        <View style={s.chips}>{Object.keys(CHOICE_NAMES).map((k) => <Chip key={k} s={s} label={CHOICE_NAMES[k]} on={ch === k} onPress={() => setCh(k)} />)}</View>
+        <Text style={s.sub2}>Print the {formOf({ f })}-question answer sheet for this quiz.{ch === 'TF' ? ' For true or false, students shade A for True and B for False.' : ''}</Text>
         <Text style={s.lab}>Classes:</Text>
         <View style={s.chips}>
           {classes.length ? classes.map((x) => <Chip key={x.id} s={s} label={x.n} on={picked.includes(x.id)} onPress={() => tog(x.id)} />)
@@ -113,6 +142,19 @@ function QuizForm({ s, c, classes, onSave, onCancel }) {
         </View>
         <Text style={s.lab}>Spreadsheet name:</Text>
         <TextInput style={s.input} value={sh} onChangeText={setSh} placeholder="Spreadsheet name" placeholderTextColor={c.mute} maxLength={40} />
+        <Text style={s.lab}>Class record column (optional):</Text>
+        <Text style={s.sub2}>Scores of registered students are entered here automatically after each scan.</Text>
+        {!picked.length ? <Text style={s.sub2}>Pick a class above first.</Text> : (
+          <View>
+            <View style={s.chips}>{[1, 2, 3].map((n) => <Chip key={n} s={s} label={'Term ' + n} on={!!rec && rec.term === n} onPress={() => setRec({ term: 1, comp: 'ww', i: 0, ...(rec || {}), term: n })} />)}</View>
+            <View style={s.chips}>{[['ww', 'Written Works'], ['pt', 'Performance Tasks'], ['ex', 'Examination']].map(([k, l]) => <Chip key={k} s={s} label={l} on={!!rec && rec.comp === k} onPress={() => setRec({ term: 1, ...(rec || {}), comp: k, i: 0 })} />)}</View>
+            {rec ? <View style={s.chips}>{(rec.comp === 'ex' ? EXN : Array.from({ length: 10 }, (_, i) => String(i + 1))).map((l, i) => <Chip key={l} s={s} label={l} on={rec.i === i} onPress={() => setRec({ ...rec, i })} />)}</View> : null}
+            {rec ? <Text style={[s.sub2, { color: c.green }]}>Scores go to {slotName(rec)}.</Text> : null}
+            {rec && (quizzes || []).some((q) => q.rec && q.rec.term === rec.term && q.rec.comp === rec.comp && q.rec.i === rec.i && q.c.some((id) => picked.includes(id)))
+              ? <Text style={[s.sub2, { color: c.red }]}>Another quiz already uses this column. Only one can fill it.</Text> : null}
+            {rec ? <Btn s={s} label="Don't send to class record" onPress={() => setRec(null)} style={{ backgroundColor: c.mute }} /> : null}
+          </View>
+        )}
       </ScrollView>
     </View>
   );
@@ -145,7 +187,11 @@ function ClassForm({ s, c, students, classes, onSave, onCancel }) {
             <Text style={[s.txt, { flex: 1 }]}>{x.name}</Text>{x.from ? <Text style={s.sub}>{x.from}</Text> : null}
           </Pressable>
         )) : <Text style={s.sub}>No students to show. Add a new student below.</Text>}
-        <AddRow s={s} c={c} placeholder="New student name" onAdd={(n) => { if (!added.includes(n)) { setAdded([...added, n]); setPicked([...picked, 'n' + n]); } }} />
+        <AddRow s={s} c={c} placeholder="New student name" onAdd={(n) => {
+          if (!checkStudent(students, '', n)) return false;
+          if (added.some((a) => a.trim().toLowerCase() === n.toLowerCase())) { Alert.alert('Student already exists', 'A student named "' + n + '" is already added to this class.'); return false; }
+          setAdded([...added, n]); setPicked([...picked, 'n' + n]);
+        }} />
       </ScrollView>
     </View>
   );
@@ -183,7 +229,8 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
       await new Promise((r) => setTimeout(r, 150)); // let the "Reading" message show before the heavy work
       const raw = jpeg.decode(fromBase64(small.base64), { useTArray: true });
       const out = readPhoto(rgbaToGray(raw.data, raw.width, raw.height), raw.width, raw.height, LAYOUTS);
-      if (out.n !== z.f) throw new ScanError(`This is a ${out.n}-question sheet, but this quiz uses ${z.f} questions.`);
+      if (out.n !== formOf(z)) throw new ScanError(`This is a ${out.n}-question sheet, but this quiz needs the ${formOf(z)}-question sheet.`);
+      if (out.answers.length > z.f) out.answers = out.answers.slice(0, z.f);
       console.log('scan ms', Date.now() - t0);
       setRes(out); setFix({}); setNameText('');
       setIdText(out.studentId.includes('?') ? '' : out.studentId);
@@ -202,7 +249,7 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
     const letters = res.answers.map((a2) => (a2.status === 'ok' ? a2.choice[0] : fix[a2.q] ? (fix[a2.q] === 'X' ? '-' : fix[a2.q]) : a2.status === 'multiple' ? '?' : '-'));
     const score = letters.filter((l, i) => l === LET[z.key[i]]).length;
     const finalId = idText.trim(); const reg = students.find((st) => st.id === finalId) || null;
-    const lay = LAYOUTS[z.f]; const [PW, PH] = lay.page; const R = lay.answers.radius * 1.3;
+    const lay = LAYOUTS[formOf(z)]; const [PW, PH] = lay.page; const R = lay.answers.radius * 1.3;
     const pos = {}; lay.answers.bubbles.forEach((b) => { (pos[b.q] = pos[b.q] || {})[b.choice] = b; });
     const rings = [];
     res.answers.forEach((ans, i) => {
@@ -252,7 +299,7 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
                 <View key={a2.q} style={{ marginTop: 10 }}>
                   <View style={s.kr}>
                     <Text style={s.kn}>{a2.q}</Text>
-                    {LET.map((l) => <Pressable key={l} onPress={() => setFix({ ...fix, [a2.q]: l })} style={[s.kb, a2.suggest === l && !fix[a2.q] && s.kbSug, fix[a2.q] === l && s.kbOn]}><Text style={[s.txt, fix[a2.q] === l && { color: c.bg }]}>{l}</Text></Pressable>)}
+                    {optsOf(z).map((l) => <Pressable key={l} onPress={() => setFix({ ...fix, [a2.q]: l })} style={[s.kb, a2.suggest === l && !fix[a2.q] && s.kbSug, fix[a2.q] === l && s.kbOn]}><Text style={[s.txt, fix[a2.q] === l && { color: c.bg }]}>{showL(z, l)}</Text></Pressable>)}
                     <Pressable onPress={() => setFix({ ...fix, [a2.q]: 'X' })} style={[s.kbN, fix[a2.q] === 'X' && s.kbOn]}><Text style={[s.sub, fix[a2.q] === 'X' && { color: c.bg }]}>None</Text></Pressable>
                   </View>
                   <Text style={[s.sub, { textAlign: 'left', marginLeft: 36 }]}>{a2.reason}{a2.status === 'multiple' ? ': ' + a2.choice.join(', ') : ''}</Text>
@@ -357,7 +404,7 @@ function MenuBtn({ s, c, icon, label, onPress }) {
 // green ring = correct answer, red ring = wrong or missed.
 function PaperView({ c, z, paper }) {
   const [W, setW] = useState(0);
-  const lay = LAYOUTS[z.f]; const [PW, PH] = lay.page; const R = lay.answers.radius; const sc = W / PW;
+  const lay = LAYOUTS[formOf(z)]; const [PW, PH] = lay.page; const R = lay.answers.radius; const sc = W / PW;
   const pos = {}; lay.answers.bubbles.forEach((b) => { (pos[b.q] = pos[b.q] || {})[b.choice] = b; });
   const els = [];
   lay.answers.bubbles.forEach((b) => {
@@ -404,7 +451,7 @@ function ItemAnalysis({ s, c, z }) {
                 <View style={{ height: BARH, justifyContent: 'flex-end' }}>
                   <View style={{ width: 24, height: Math.max(2, (k.n / n) * BARH), backgroundColor: k.right ? c.green : c.red }} />
                 </View>
-                <Text style={s.iaL}>{k.l === '-' ? '\u2013' : k.l}</Text><Text style={s.iaC}>{k.n}</Text>
+                <Text style={s.iaL}>{k.l === '-' ? '\u2013' : showL(z, k.l)}</Text><Text style={s.iaC}>{k.n}</Text>
               </View>
             ))}
           </View>
@@ -458,7 +505,7 @@ function ScanStrip({ k, uri, style, fallback }) {
 }
 // Green / red rings for one graded paper, in points on the printed page.
 function paperRings(c, z, paper) {
-  const lay = LAYOUTS[z.f]; const R = lay.answers.radius * 1.3; const pos = {}; const out = [];
+  const lay = LAYOUTS[formOf(z)]; const R = lay.answers.radius * 1.3; const pos = {}; const out = [];
   lay.answers.bubbles.forEach((b) => { (pos[b.q] = pos[b.q] || {})[b.choice] = b; });
   const at = (q, ch, color, thin) => { const b = pos[q] && pos[q][ch]; if (b) out.push({ x: b.x, y: b.y, color, thin }); };
   for (let i = 0; i < z.f; i++) {
@@ -490,15 +537,39 @@ function Field({ s, c, label, ...p }) {
   return <View><Text style={s.lab}>{label}</Text><TextInput style={s.input} placeholderTextColor={c.mute} autoCapitalize="none" autoCorrect={false} {...p} /></View>;
 }
 
+// "Rename" link that opens a small box to change a quiz, class or spreadsheet name.
+function RenameBar({ s, c, value, label, onSave }) {
+  const [edit, setEdit] = useState(false); const [t, setT] = useState(value);
+  useEffect(() => { setT(value); }, [value]);
+  const save = () => { const n = t.trim(); if (!n) return Alert.alert('Enter a name'); onSave(n); setEdit(false); };
+  if (!edit) {
+    return (
+      <Pressable onPress={() => setEdit(true)} style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
+        <Ionicons name="create-outline" size={16} color={c.mute} /><Text style={[s.sub2, { marginLeft: 4 }]}>Rename</Text>
+      </Pressable>
+    );
+  }
+  return (
+    <View style={{ marginBottom: 8 }}>
+      <Field s={s} c={c} label={label} value={t} onChangeText={setT} autoCapitalize="words" maxLength={60} />
+      <View style={s.row}>
+        <Btn s={s} label="Save" onPress={save} style={{ flex: 1 }} />
+        <Btn s={s} label="Cancel" onPress={() => { setT(value); setEdit(false); }} style={{ flex: 1, backgroundColor: c.mute }} />
+      </View>
+    </View>
+  );
+}
+
 // One learner in a class: tap to rename or change the student ID.
-function StudentRow({ s, c, st, taken, onSave, onRemove }) {
+function StudentRow({ s, c, st, clash, onSave, onRemove }) {
   const [edit, setEdit] = useState(false); const [name, setName] = useState(st.name); const [id, setId] = useState(st.id);
   useEffect(() => { setName(st.name); setId(st.id); }, [st.name, st.id]);
   const save = () => {
     const n = name.trim(); const i = id.trim();
     if (!n) return Alert.alert('Enter a name');
     if (!/^\d{1,12}$/.test(i)) return Alert.alert('Student ID must be numbers only', 'The answer sheet can only read digits.');
-    if (i !== st.id && taken(i)) return Alert.alert('That ID is already used', 'Another student has this ID.');
+    const dup = clash(i !== st.id ? i : '', n !== st.name ? n : ''); // only check what was changed
+    if (dup) return Alert.alert('Student already exists', dup);
     onSave(st.id, n, i); setEdit(false);
   };
   if (!edit) {
@@ -584,16 +655,24 @@ function Cell({ s, value, onCommit }) {
 
 function EcrSetup({ s, c, info, onSave, onCancel }) {
   const [f, setF] = useState(info);
+  const pct0 = (info.w && info.w.length === 3 ? info.w : (TRACKS.find((x) => x.k === info.track) || TRACKS[0]).w.map((x) => Math.round(x * 100)));
+  const [wt, setWt] = useState(pct0.map(String));
+  const wNum = wt.map((x) => (x === '' || isNaN(Number(x)) ? 0 : Number(x))); const wTotal = Math.round(wNum.reduce((a, b) => a + b, 0) * 100) / 100;
+  const putW = (i) => (v) => setWt(wt.map((x, k) => (k === i ? v.replace(/[^0-9.]/g, '') : x)));
+  const trySave = () => { if (wTotal !== 100) return Alert.alert('Weights must add up to 100%', 'Now they add up to ' + wTotal + '%.'); onSave({ ...f, w: wNum }); };
   const put = (k) => (v) => setF({ ...f, [k]: v });
   const fields = [['region', 'Region'], ['division', 'Division'], ['schoolId', 'School ID'], ['school', 'School name'], ['teacher', 'Teacher'], ['section', 'Section'], ['subject', 'Subject']];
   return (
     <View>
       {fields.map(([k, l]) => <Field key={k} s={s} c={c} label={l + ':'} value={f[k]} onChangeText={put(k)} placeholder={l} autoCapitalize="words" />)}
       <Text style={s.lab}>Subject track (sets the WW / PT / Exam weights):</Text>
-      <View style={s.chips}>{TRACKS.map((t) => <Chip key={t.k} s={s} label={t.n} on={f.track === t.k} onPress={() => setF({ ...f, track: t.k })} />)}</View>
+      <View style={s.chips}>{TRACKS.map((t) => <Chip key={t.k} s={s} label={t.n} on={f.track === t.k} onPress={() => { setF({ ...f, track: t.k }); setWt(t.w.map((x) => String(Math.round(x * 100)))); }} />)}</View>
+      <Text style={s.lab}>Weights (you can change them, must add up to 100%):</Text>
+      {[['Written Works', 0], ['Performance Tasks', 1], ['Examination', 2]].map(([l, i]) => <Field key={i} s={s} c={c} label={l + ' %:'} value={wt[i]} onChangeText={putW(i)} keyboardType="decimal-pad" maxLength={5} placeholder="0" />)}
+      <Text style={[s.sub2, { color: wTotal === 100 ? c.green : c.red }]}>Total: {wTotal}%</Text>
       <Text style={s.lab}>Number of terms the subject is taught:</Text>
       <View style={s.chips}>{[1, 2, 3].map((n) => <Chip key={n} s={s} label={String(n)} on={f.terms === n} onPress={() => setF({ ...f, terms: n })} />)}</View>
-      <Btn s={s} label="Save class info" onPress={() => onSave(f)} />
+      <Btn s={s} label="Save class info" onPress={trySave} />
       <Btn s={s} label="Cancel" onPress={onCancel} style={{ backgroundColor: c.mute }} />
     </View>
   );
@@ -610,6 +689,7 @@ function ClassRecord({ s, c, cls, students, quizzes, saved, onSave, onBack }) {
   const studs = cls.s.map((id) => students.find((x) => x.id === id)).filter(Boolean);
   const set = (fn) => { const r = JSON.parse(JSON.stringify(rec)); fn(r); onSave(r); };
   const info = rec.info; const track = TRACKS.find((t) => t.k === info.track) || TRACKS[0];
+  const wts = info.w && info.w.length === 3 && Math.round(info.w.reduce((a, b) => a + b, 0) * 100) === 10000 ? info.w.map((x) => x / 100) : track.w;
   const slot = (n, k, i) => quizzes.find((q) => q.rec && q.rec.term === n && q.rec.comp === k && q.rec.i === i && q.c.includes(cls.id));
 
   const calc = (n) => {
@@ -623,13 +703,13 @@ function ClassRecord({ s, c, cls, students, quizzes, saved, onSave, onBack }) {
         const q = src[k][i];
         if (q) { const p = q.res.find((r) => r.id === st.id); sc[k][i] = p ? scoreOf(q, p) : ''; } else sc[k][i] = ((T.sc[st.id] || {})[k] || [])[i];
       }));
-      return { st, sc, r: termCalc(info.track, hps, sc) };
+      return { st, sc, r: termCalc(info.track, hps, sc, wts) };
     });
     return { hps, src, rows, loose };
   };
   const head = (title) => [
     ['Class record', cls.n], ['Region', info.region], ['Division', info.division], ['School ID', info.schoolId], ['School', info.school],
-    ['Teacher', info.teacher], ['Section', info.section], ['Subject', info.subject], ['Track', track.n], [], [title], [],
+    ['Teacher', info.teacher], ['Section', info.section], ['Subject', info.subject], ['Track', track.n], ['Weights', 'WW ' + Math.round(wts[0] * 1000) / 10 + '%, PT ' + Math.round(wts[1] * 1000) / 10 + '%, Exam ' + Math.round(wts[2] * 1000) / 10 + '%'], [], [title], [],
   ];
 
   if (view === 'setup') {
@@ -656,7 +736,7 @@ function ClassRecord({ s, c, cls, students, quizzes, saved, onSave, onBack }) {
       <View>
         <Pressable onPress={() => setView('menu')}><Text style={s.back}>{'\u2190'} Class record</Text></Pressable>
         <Text style={s.h1}>Term {term}</Text>
-        <Text style={s.sub2}>{info.subject || 'No subject yet'}. Weights: WW {Math.round(track.w[0] * 100)}%, PT {Math.round(track.w[1] * 100)}%, Exam {Math.round(track.w[2] * 100)}%.</Text>
+        <Text style={s.sub2}>{info.subject || 'No subject yet'}. Weights: WW {Math.round(wts[0] * 1000) / 10}%, PT {Math.round(wts[1] * 1000) / 10}%, Exam {Math.round(wts[2] * 1000) / 10}%.</Text>
         <Text style={s.sub2}>Green columns fill in automatically from scanned quizzes. Type the highest possible score (HPS) and scores for any other column.</Text>
         {loose ? <Text style={[s.sub2, { color: c.red }]}>{loose} scanned paper{loose > 1 ? 's' : ''} in these quizzes could not be matched to a learner in this class. Open the quiz, Review Papers, and assign them.</Text> : null}
         {!studs.length ? <Text style={s.empty}>This class has no learners yet. Add them on the Classes tab.</Text> : (
@@ -740,7 +820,55 @@ const checkNew = (f) => {
   if (f.password !== f.confirm) return 'The passwords do not match.';
   return '';
 };
-function AuthScreen({ s, c, onLogin, onRegister }) {
+function ForgotPassword({ s, c, email: email0, onSendCode, onReset, onBack }) {
+  const [email, setEmail] = useState(email0 || '');
+  const [step, setStep] = useState('email');
+  const [code, setCode] = useState(''); const [pw, setPw] = useState(''); const [pw2, setPw2] = useState('');
+  const [err, setErr] = useState(''); const [busy, setBusy] = useState(false);
+  const send = async () => {
+    if (busy) return;
+    if (!/^\S+@\S+\.\S+$/.test(email.trim())) return setErr('Enter a valid email address.');
+    setBusy(true); const e = await onSendCode(email); setBusy(false);
+    if (e) return setErr(e);
+    setErr(''); setStep('code');
+  };
+  const save = async () => {
+    if (busy) return;
+    if (code.trim().length < 6) return setErr('Enter the code from your email.');
+    if (pw.length < 6) return setErr('Password must be at least 6 characters.');
+    if (pw !== pw2) return setErr('The passwords do not match.');
+    setBusy(true); const e = await onReset(email, code, pw);
+    if (e) { setBusy(false); setErr(e); }
+  };
+  return (
+    <View style={[s.root, { paddingTop: TOP + 10 }]}>
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <ScrollView contentContainerStyle={{ paddingHorizontal: 24, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
+          <View style={{ alignItems: 'center', marginTop: 18, marginBottom: 8 }}>
+            <Image source={require('./assets/gurogabay-logo.png')} style={{ width: 150, height: 130 }} resizeMode="contain" />
+            <Text style={[s.h1, { marginLeft: 0, marginTop: 14, marginBottom: 2 }]}>Reset password</Text>
+            <Text style={[s.sub2, { marginLeft: 0, textAlign: 'center' }]}>
+              {step === 'email' ? "We'll email you a 6-digit code." : 'Enter the code we sent to ' + email.trim()}
+            </Text>
+          </View>
+          {step === 'email'
+            ? <Field s={s} c={c} label="Email" value={email} onChangeText={(t) => { setEmail(t); setErr(''); }} placeholder="teacher@school.com" keyboardType="email-address" autoCapitalize="none" />
+            : <>
+                <Field s={s} c={c} label="Code" value={code} onChangeText={(t) => { setCode(t); setErr(''); }} keyboardType="number-pad" maxLength={10} />
+                <Field s={s} c={c} label="New password" value={pw} onChangeText={(t) => { setPw(t); setErr(''); }} secureTextEntry autoCapitalize="none" />
+                <Field s={s} c={c} label="Confirm new password" value={pw2} onChangeText={(t) => { setPw2(t); setErr(''); }} secureTextEntry autoCapitalize="none" />
+              </>}
+          {err ? <Text style={[s.sub, { color: c.red, textAlign: 'left', fontSize: 14, marginTop: 6 }]}>{err}</Text> : null}
+          <Btn s={s} label={busy ? 'Please wait...' : step === 'email' ? 'Send code' : 'Save new password'}
+            onPress={step === 'email' ? send : save} disabled={busy} style={{ marginHorizontal: 0 }} />
+          {step === 'code' ? <Pressable onPress={send} style={{ alignItems: 'center', paddingVertical: 14 }}><Text style={[s.txt, { color: c.green }]}>Resend code</Text></Pressable> : null}
+          <Pressable onPress={onBack} style={{ alignItems: 'center', paddingVertical: 10 }}><Text style={[s.txt, { color: c.green }]}>Back to sign in</Text></Pressable>
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </View>
+  );
+}
+function AuthScreen({ s, c, onLogin, onRegister, onSendCode, onReset }) {
   const [mode, setMode] = useState('login');
   const [f, setF] = useState({ name: '', school: '', user: '', password: '', confirm: '' });
   const [err, setErr] = useState(''); const [busy, setBusy] = useState(false); const [stay, setStay] = useState(true); const [show, setShow] = useState(false);
@@ -754,6 +882,7 @@ function AuthScreen({ s, c, onLogin, onRegister }) {
       Promise.resolve(reg ? onRegister(f, stay) : onLogin(f, stay)).then((r) => { if (r) { setErr(r); setBusy(false); } }).catch(() => { setErr('Something went wrong. Try again.'); setBusy(false); });
     }, 40);
   };
+  if (mode === 'forgot') return <ForgotPassword s={s} c={c} email={f.user} onSendCode={onSendCode} onReset={onReset} onBack={() => setMode('login')} />;
   return (
     <View style={[s.root, { paddingTop: TOP + 10 }]}>
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
@@ -773,6 +902,8 @@ function AuthScreen({ s, c, onLogin, onRegister }) {
             <Pressable onPress={() => setShow(!show)} style={{ paddingHorizontal: 14 }} accessibilityLabel="Show or hide password"><Ionicons name={show ? 'eye-off-outline' : 'eye-outline'} size={22} color={c.mute} /></Pressable>
           </View>
           {reg ? <Field s={s} c={c} label="Confirm password" value={f.confirm} onChangeText={put('confirm')} secureTextEntry={!show} placeholder="Type it again" /> : null}
+          {!reg ? <Pressable onPress={() => { setMode('forgot'); setErr(''); }} style={{ alignSelf: 'flex-end', marginBottom: 12 }}>
+            <Text style={[s.txt, { color: c.green }]}>Forgot password?</Text></Pressable> : null}
           <View style={s.row}><Text style={[s.txt, { flex: 1 }]}>Stay signed in on this phone</Text><Switch value={stay} onValueChange={setStay} trackColor={{ true: c.green }} /></View>
           {err ? <Text style={[s.sub, { color: c.red, textAlign: 'left', fontSize: 14, marginTop: 6 }]}>{err}</Text> : null}
           <Btn s={s} label={busy ? 'Please wait...' : reg ? 'Create account' : 'Sign in'} onPress={submit} disabled={busy} style={{ marginHorizontal: 0 }} />
@@ -786,7 +917,7 @@ function AuthScreen({ s, c, onLogin, onRegister }) {
   );
 }
 
-function AccountPage({ s, c, acct, stats, onSave, onLogout, onDelete }) {
+function AccountPage({ s, c, acct, stats, onSave, onLogout, onDelete, onSync }) {
   const [name, setName] = useState(acct.name); const [school, setSchool] = useState(acct.school || '');
   const [cur, setCur] = useState(''); const [pw, setPw] = useState(''); const [pw2, setPw2] = useState(''); const [msg, setMsg] = useState(''); const [pmsg, setPmsg] = useState('');
   const saveProfile = () => { if (!name.trim()) return setMsg('Enter your name.'); onSave({ name: name.trim(), school: school.trim() }); setMsg('Saved.'); };
@@ -820,6 +951,7 @@ function AccountPage({ s, c, acct, stats, onSave, onLogout, onDelete }) {
       <Field s={s} c={c} label="Confirm new password" value={pw2} onChangeText={(t) => { setPw2(t); setPmsg(''); }} secureTextEntry />
       {pmsg ? <Text style={[s.sub2, { color: pmsg === 'Password changed.' ? c.green : c.red }]}>{pmsg}</Text> : null}
       <Btn s={s} label="Change password" onPress={changePw} style={{ marginHorizontal: 0 }} />
+      <Btn s={s} label="Sync now" style={{ marginHorizontal: 0, backgroundColor: c.mute, marginTop: 16 }} onPress={onSync} />
       <Btn s={s} label="Log out" onPress={onLogout} style={{ marginHorizontal: 0, backgroundColor: c.mute, marginTop: 28 }} />
       <Btn s={s} label="Delete this account" style={{ marginHorizontal: 0, backgroundColor: c.red }} onPress={() => Alert.alert('Delete your account?', 'All your quizzes, classes and scores on this phone will be erased and you will be signed out. This cannot be undone.', [
         { text: 'Cancel', style: 'cancel' }, { text: 'Delete everything', style: 'destructive', onPress: onDelete }])} />
@@ -828,7 +960,7 @@ function AccountPage({ s, c, acct, stats, onSave, onLogout, onDelete }) {
 }
 
 // Who a saved paper belongs to. Unregistered papers can be assigned to a student or registered as a new one.
-function PaperWho({ s, c, z, r, students, classes, onEdit, onRegister }) {
+function PaperWho({ s, c, z, r, students, classes, onEdit, onRegister, onAddToClass }) {
   const [open, setOpen] = useState(false); const [name, setName] = useState(r.name); const [id, setId] = useState(r.id);
   useEffect(() => { setName(r.name); setId(r.id); setOpen(false); }, [r.uid]);
   const reg = students.find((st) => st.id === r.id);
@@ -841,6 +973,11 @@ function PaperWho({ s, c, z, r, students, classes, onEdit, onRegister }) {
   return (
     <View>
       {!reg ? <Text style={[s.sub2, { color: AMBER }]}>Not registered. The score is saved, but the class record can only use it after you assign it to a student.</Text> : null}
+      {reg && !z.rec ? <Text style={[s.sub2, { color: AMBER }]}>This quiz is not linked to a class record column yet. Open Class record entry in the quiz menu.</Text> : null}
+      {reg && z.rec && !classes.some((cl) => z.c.includes(cl.id) && cl.s.includes(r.id)) ? <Text style={[s.sub2, { color: AMBER }]}>{r.name} is not in any class of this quiz, so the score will not reach a class record.</Text> : null}
+      {reg && z.rec && z.c.length && !classes.some((cl) => z.c.includes(cl.id) && cl.s.includes(r.id))
+        ? classes.filter((cl) => z.c.includes(cl.id)).map((cl) => <Btn key={cl.id} s={s} label={'Add ' + r.name + ' to ' + cl.n} onPress={() => onAddToClass(cl.id, r.id)} style={{ marginHorizontal: 0, backgroundColor: c.green }} />) : null}
+      {reg && z.rec && classes.some((cl) => z.c.includes(cl.id) && cl.s.includes(r.id)) ? <Text style={[s.sub2, { color: c.green }]}>Entered in the class record: {slotName(z.rec)}.</Text> : null}
       <Btn s={s} label={open ? 'Close' : 'Edit name or ID'} onPress={() => setOpen(!open)} style={{ marginHorizontal: 0 }} />
       {open ? (
         <View>
@@ -916,28 +1053,30 @@ function TosEditor({ s, c, z, quizzes, onSave }) {
   const donors = quizzes.filter((q) => q.id !== z.id && q.tos && q.tos.comps && q.tos.comps.length);
   return (
     <View>
-      <Btn s={s} label={busy ? 'Reading the file...' : 'Upload TOS (PDF, photo or Excel)'} onPress={upload} disabled={busy} />
-      {busy ? <ActivityIndicator color={c.ink} style={{ marginVertical: 8 }} /> : null}
+      <View style={{ marginBottom: 16 }}>
+        <Btn s={s} label={busy ? 'Reading the file...' : 'Upload TOS (PDF, photo or Excel)'} onPress={upload} disabled={busy} />
+        {busy ? <ActivityIndicator color={c.ink} style={{ marginTop: 10 }} /> : null}
+      </View>
       {comps.map((x, k) => (
         <View key={k} style={[s.list, { marginBottom: 10, padding: 14 }]}>
           <Text style={s.txt}>{k + 1}. {x.n}</Text>
           <Text style={s.sub2}>{x.items.length} items ({pct(x.items.length)})   Items: {itemsText(x.items)}</Text>
           {x.lv ? <Text style={s.sub2}>{TOS_LEVELS.map((l, i) => LV_SHORT[i] + ' ' + (x.lv[i] || 0)).join('   ')}</Text> : null}
-          <View style={s.row}>
+          <View style={[s.row, { marginTop: 14 }]}>
             <Btn s={s} label="Edit" onPress={() => open(k)} style={{ flex: 1 }} />
             <Btn s={s} label="Delete" style={{ flex: 1, backgroundColor: c.red }} onPress={() => Alert.alert('Delete this competency?', x.n, [{ text: 'Cancel', style: 'cancel' }, { text: 'Delete', style: 'destructive', onPress: () => onSave({ comps: comps.filter((_, i) => i !== k) }) }])} />
           </View>
         </View>
       ))}
       {!comps.length ? <Text style={s.empty}>No competencies yet. Add the first one from your table of specification.</Text> : (
-        <View style={s.list}>
+        <View style={[s.list, { marginTop: 4, marginBottom: 12 }]}>
           <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Items covered</Text><Text style={[s.txt, chk.missing.length && { color: c.red }]}>{chk.total} / {z.f}</Text></View>
           {chk.lv.some((v) => v) ? <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Easy / Average / Difficult</Text><Text style={s.txt}>{chk.easy} / {chk.average} / {chk.difficult}</Text></View> : null}
         </View>
       )}
       {chk.missing.length && comps.length ? <Text style={[s.sub2, { color: c.red }]}>No competency yet for item{chk.missing.length > 1 ? 's' : ''} {itemsText(chk.missing)}. They are left out of the analysis.</Text> : null}
       {chk.levelMismatch.length ? <Text style={[s.sub2, { color: AMBER }]}>The levels of thinking do not add up to the number of items in competency {chk.levelMismatch.map((k) => k + 1).join(', ')}.</Text> : null}
-      <Btn s={s} label="Add competency" onPress={() => open(-1)} />
+      <Btn s={s} label="Add competency" onPress={() => open(-1)} style={{ marginTop: 8 }} />
       {donors.length ? <View><Text style={s.lab}>Copy the table from another quiz:</Text><View style={s.chips}>{donors.map((q) => <Chip key={q.id} s={s} label={q.n} on={false} onPress={() => copyFrom(q)} />)}</View></View> : null}
       {comps.length ? <Btn s={s} label="Share table (CSV file)" onPress={() => shareCsv(z.n + '_TOS', tosCsvRows(z))} style={{ backgroundColor: c.mute }} /> : null}
     </View>
@@ -983,34 +1122,133 @@ function CompAnalysis({ s, c, z, classes, onTos }) {
   );
 }
 
+const CONTACT_EMAIL = 'guro.gabay.inc@gmail.com'; // change this to the email that should receive messages
+
 function Contact({ s, c }) {
   const [m, setM] = useState('');
+  const [err, setErr] = useState('');
+  const send = async () => {
+    if (!m.trim()) return setErr('Enter a message first.');
+    setErr('');
+    const url = 'mailto:' + CONTACT_EMAIL + '?subject=' + encodeURIComponent('GuroGabay support') + '&body=' + encodeURIComponent(m.trim());
+    try {
+      await Linking.openURL(url);
+      setM('');
+    } catch (e) {
+      Alert.alert('No email app found', 'Set up an email app on this phone, or write to us at ' + CONTACT_EMAIL + '.');
+    }
+  };
   return (
     <View>
       <Text style={s.lab}>Message</Text>
-      <TextInput style={[s.input, { height: 140, textAlignVertical: 'top', paddingTop: 12 }]} multiline value={m} onChangeText={setM}
+      <TextInput style={[s.input, { height: 140, textAlignVertical: 'top', paddingTop: 12 }]} multiline value={m} onChangeText={(t) => { setM(t); setErr(''); }}
         placeholder="Tell us what you need" placeholderTextColor={c.mute} />
-      <Btn s={s} label="Send message" onPress={() => { if (m.trim()) { setM(''); Alert.alert('Message ready to send in the full app'); } }} />
+      {err ? <Text style={[s.sub2, { color: c.red }]}>{err}</Text> : null}
+      <Btn s={s} label="Send message" onPress={send} />
+      <Text style={[s.sub2, { marginTop: 12 }]}>Or email us at {CONTACT_EMAIL}</Text>
     </View>
   );
 }
 
-function Main({ acct, onAccount, onLogout, onDelete }) {
-  const scheme = useColorScheme();
+const DRAWER_W = Math.min(Dimensions.get('window').width * 0.78, 320);
+// Side menu: solid drawer slides in/out over a fading dim layer (no see-through fade).
+function SideMenu({ s, visible, onClose, children }) {
+  const [mounted, setMounted] = useState(visible);
+  const p = useSharedValue(0);
+  useEffect(() => {
+    if (visible) {
+      setMounted(true);
+      p.value = withTiming(1, { duration: 260, easing: Easing.out(Easing.cubic) });
+    } else if (mounted) {
+      p.value = withTiming(0, { duration: 200, easing: Easing.in(Easing.cubic) }, (done) => { if (done) runOnJS(setMounted)(false); });
+    }
+  }, [visible]);
+  const drawer = useAnimatedStyle(() => ({ transform: [{ translateX: -DRAWER_W * (1 - p.value) }] }));
+  const dim = useAnimatedStyle(() => ({ opacity: p.value }));
+  return (
+    <Modal transparent animationType="none" visible={mounted} onRequestClose={onClose} statusBarTranslucent>
+      <View style={s.menuWrap}>
+        <Animated.View style={[s.drawer, { width: DRAWER_W }, drawer]}>{children}</Animated.View>
+        <Animated.View style={[{ flex: 1, backgroundColor: 'rgba(0,0,0,0.4)' }, dim]}>
+          <Pressable style={{ flex: 1 }} pressScale={1} onPress={onClose} accessibilityLabel="Close menu" />
+        </Animated.View>
+      </View>
+    </Modal>
+  );
+}
+
+const NAV_KEYS = ['home', 'classes', 'add', 'sheet', 'recent'];
+// Bottom bar: raised pill holding a recessed track; a white pill slides behind the selected tab.
+function NavBar({ s, c, tab, det, go, plus }) {
+  const [tw, setTw] = useState(0);
+  const slot = tw ? (tw - 8) / 5 : 0;
+  const idx = NAV_KEYS.indexOf(tab);
+  const show = !det && tab !== 'add' && idx >= 0 ? 1 : 0;
+  const x = useSharedValue(0); const o = useSharedValue(0);
+  useEffect(() => {
+    if (!slot) return;
+    const target = 4 + Math.max(idx, 0) * slot + 3;
+    if (o.value === 0) x.value = target; else x.value = withTiming(target, { duration: 220, easing: Easing.out(Easing.cubic) });
+    o.value = withTiming(show, { duration: 150 });
+  }, [slot, idx, show]);
+  const pill = useAnimatedStyle(() => ({ opacity: o.value, transform: [{ translateX: x.value }] }));
+  return (
+    <View style={s.nav}>
+      <View style={s.navTrack} onLayout={(e) => setTw(e.nativeEvent.layout.width)}>
+        <Animated.View pointerEvents="none" style={[s.navPill, { width: Math.max(slot - 6, 0) }, pill]} />
+        {NAV_KEYS.map((k) => k === 'add'
+          ? <View key={k} style={s.navSlot}><Pressable style={s.addBtn} onPress={plus} accessibilityLabel="Create"><Ionicons name="add" size={30} color={c.bg} /></Pressable></View>
+          : <Pressable key={k} style={s.navSlot} onPress={() => go(k)} accessibilityLabel={TITLES[k]}><Ionicons name={ICONS[k]} size={28} color={tab === k && !det ? c.ink : c.mute} /></Pressable>)}
+      </View>
+    </View>
+  );
+}
+
+function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
   const c = scheme === 'dark' ? DARK : LIGHT;
   const s = useMemo(() => mk(c), [scheme]);
   const [data, setData] = useState(EMPTY);
   const [ready, setReady] = useState(false);
   const [tab, setTab] = useState('home'); const [det, setDet] = useState(null);
   const [q, setQ] = useState(''); const [modal, setModal] = useState(null); const [menu, setMenu] = useState(false);
-  const [scanQ, setScanQ] = useState(null); const [qtab, setQtab] = useState('details'); const [stab, setStab] = useState('quiz');
+  const [scanQ, setScanQ] = useState(null); const [qtab, setQtab] = useState('details'); const [stab, setStab] = useState('quiz'); const [ctab, setCtab] = useState('classes');
   const dataKey = KEY + ':' + acct.id;
 
+  // Sync with the online account: pull newer data from another phone, push this phone's changes.
+  const skipMark = useRef(1); const syncTimer = useRef(null);
+  const doSync = async (manual) => {
+    try {
+      const r = await syncNow(acct.id);
+      if (r === 'pulled') { const v = await AsyncStorage.getItem(dataKey); if (v) { skipMark.current = 1; setData(migrate(JSON.parse(v))); } }
+      if (manual === true) Alert.alert('Sync', r === null ? 'Could not sync right now (not signed in online, or a sync is already running). Try again.' : r === 'pulled' ? 'Updated from your online account.' : r === 'pushed' ? 'Your changes were uploaded.' : 'Everything is already up to date.');
+    } catch (e) { console.log('sync failed', e && e.message); if (manual === true) Alert.alert('Sync failed', String((e && e.message) || e)); }
+  };
   useEffect(() => {
-    AsyncStorage.getItem(dataKey).then((v) => { if (v) setData(migrate(JSON.parse(v))); setReady(true); });
+    const sub = AppState.addEventListener('change', (st) => { if (st === 'active') doSync(); });
+    return () => { sub.remove(); clearTimeout(syncTimer.current); };
+  }, []);
+  // Realtime: when another device (or the website) changes this account's rows online, sync right away.
+  useEffect(() => {
+    let timer;
+    const channel = supabase
+      .channel('sync_records_' + acct.id)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'sync_records', filter: 'user_id=eq.' + acct.id }, () => {
+        clearTimeout(timer); timer = setTimeout(() => doSync(), 1500); // many rows can change at once: sync only once
+      })
+      .subscribe();
+    return () => { clearTimeout(timer); supabase.removeChannel(channel); };
+  }, [acct.id]);
+  useEffect(() => {
+    AsyncStorage.getItem(dataKey).then((v) => { if (v) setData(migrate(JSON.parse(v))); setReady(true); doSync(); });
     AsyncStorage.getAllKeys().then((ks) => { const old = ks.filter((k) => k.startsWith(OLD_THUMB + acct.id + ':')); if (old.length) AsyncStorage.multiRemove(old); }).catch(() => {});
   }, [dataKey]);
-  useEffect(() => { if (ready) AsyncStorage.setItem(dataKey, JSON.stringify(data)); }, [data, ready]);
+  useEffect(() => {
+    if (!ready) return;
+    AsyncStorage.setItem(dataKey, JSON.stringify(data)).then(() => {
+      if (skipMark.current > 0) { skipMark.current--; return; } // loading or pulling, not a teacher edit
+      return markSaved(acct.id).then(() => { clearTimeout(syncTimer.current); syncTimer.current = setTimeout(doSync, 4000); });
+    }).catch(() => {});
+  }, [data, ready]);
   const upd = (fn) => setData((d) => fn(JSON.parse(JSON.stringify(d))));
   const { quizzes, classes, students, log } = data;
   const byId = (arr, id) => arr.find((x) => x.id === id);
@@ -1019,7 +1257,7 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
   const openScan = (id) => { if (!quizzes.length) return Alert.alert('Create a quiz first'); setScanQ(id || (det && det.k === 'quiz' ? det.id : quizzes[0].id)); setModal('scan'); };
 
   const saveQuiz = (f) => {
-    upd((d) => { d.quizzes.unshift({ id: uid(), n: f.name, d: today(), f: f.f, c: f.c, sh: f.sh, key: Array(f.f).fill(-1), res: [] }); d.log.unshift({ t: 'Created quiz ' + f.name, d: today() }); return d; });
+    upd((d) => { d.quizzes.unshift({ id: uid(), n: f.name, d: today(), f: f.f, ch: f.ch || 'AE', c: f.c, sh: f.sh, key: Array(f.f).fill(-1), res: [], rec: f.rec || null }); d.log.unshift({ t: 'Created quiz ' + f.name, d: today() }); return d; });
     setModal(null); setDet(null); setTab('home');
   };
   const saveClass = (f) => {
@@ -1049,10 +1287,14 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
   const editPaper = (quizId, puid, name, id) => upd((d) => {
     const z = byId(d.quizzes, quizId); const r = z.res.find((x) => x.uid === puid); if (!r) return d;
     const st = d.students.find((x) => x.id === id);
+    if (st && id === r.id && name && name.trim() && name.trim() !== st.name) { // same student, new name: rename the student everywhere
+      st.name = name.trim(); d.quizzes.forEach((q) => q.res.forEach((x) => { if (x.id === id) x.name = st.name; }));
+    }
     if (id) z.res = z.res.filter((x) => x.uid === puid || x.id !== id);
     r.id = id; r.name = st ? st.name : name || (id ? 'ID ' + id : 'Unnamed paper'); return d;
   });
-  const registerStudent = (quizId, puid, name, id) => upd((d) => {
+  const registerStudent = (quizId, puid, name, id) => { if (!checkStudent(students, id, name)) return; registerStudentNow(quizId, puid, name, id); };
+  const registerStudentNow = (quizId, puid, name, id) => upd((d) => {
     const z = byId(d.quizzes, quizId); const sid = id && !d.students.some((x) => x.id === id) ? id : freshId(d);
     d.students.push({ id: sid, name }); z.c.forEach((cid) => { const cl = byId(d.classes, cid); if (cl && !cl.s.includes(sid)) cl.s.push(sid); });
     const r = z.res.find((x) => x.uid === puid); if (r) { r.id = sid; r.name = name; }
@@ -1071,16 +1313,55 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
     d.quizzes.forEach((q) => q.res.forEach((r) => { if (r.id === newId) r.name = name; }));
     d.log.unshift({ t: 'Updated student ' + name, d: today() }); return d;
   });
+  // Delete a quiz with its papers, scan pictures and table of specification.
+  const deleteQuiz = (quizId) => {
+    const z = byId(quizzes, quizId); if (!z) return;
+    z.res.forEach((r) => dropThumb(r.uid));
+    upd((d) => { d.quizzes = d.quizzes.filter((x) => x.id !== quizId); d.log.unshift({ t: 'Deleted quiz ' + z.n, d: today() }); return d; });
+    setDet(null);
+  };
+  // Delete a class. Students who are in no other class and have no saved papers are removed too.
+  const deleteStudent = (st) => upd((d) => {
+    d.students = d.students.filter((x) => x.id !== st.id);
+    d.classes.forEach((cl) => { cl.s = (cl.s || []).filter((x) => x !== st.id); });
+    Object.keys(d.ecr || {}).forEach((cid) => { const rc = d.ecr[cid]; Object.keys((rc && rc.t) || {}).forEach((n) => { if (rc.t[n] && rc.t[n].sc) delete rc.t[n].sc[st.id]; }); });
+    d.log.unshift({ t: 'Deleted student ' + st.name, d: today() }); return d;
+  });
+  const askDeleteStudent = (st) => Alert.alert('Delete "' + st.name + '"?', 'They are removed from every class and class record. Scanned papers stay in their quizzes. This cannot be undone.', [
+    { text: 'Cancel', style: 'cancel' }, { text: 'Delete', style: 'destructive', onPress: () => deleteStudent(st) }]);
+  const deleteClass = (classId) => {
+    const cl = byId(classes, classId); if (!cl) return;
+    upd((d) => {
+      d.classes = d.classes.filter((x) => x.id !== classId);
+      d.quizzes.forEach((q) => { q.c = q.c.filter((i) => i !== classId); });
+      if (d.ecr) delete d.ecr[classId];
+      d.students = d.students.filter((st) => d.classes.some((x) => x.s.includes(st.id)) || d.quizzes.some((q) => q.res.some((r) => r.id === st.id)) || !cl.s.includes(st.id));
+      d.log.unshift({ t: 'Deleted class ' + cl.n, d: today() }); return d;
+    });
+    setDet(null);
+  };
+  const renameQuiz = (quizId, name) => upd((d) => { const q = byId(d.quizzes, quizId); if (q) { d.log.unshift({ t: 'Renamed quiz ' + q.n + ' to ' + name, d: today() }); q.n = name; } return d; });
+  const renameSheet = (quizId, name) => upd((d) => { const q = byId(d.quizzes, quizId); if (q) q.sh = name; return d; });
+  const renameClass = (classId, name) => upd((d) => { const cl = byId(d.classes, classId); if (cl) { d.log.unshift({ t: 'Renamed class ' + cl.n + ' to ' + name, d: today() }); cl.n = name; } return d; });
+  const askDeleteQuiz = (z) => Alert.alert('Delete quiz "' + z.n + '"?', 'Its ' + z.res.length + ' scanned paper(s), answer key and table of specification will be permanently deleted. Scores it filled into a class record will be removed too. This cannot be undone.', [
+    { text: 'Cancel', style: 'cancel' }, { text: 'Delete', style: 'destructive', onPress: () => deleteQuiz(z.id) }]);
+  const askDeleteClass = (x) => Alert.alert('Delete class "' + x.n + '"?', 'The class, its class record and its student list will be permanently deleted. Scanned papers stay in their quizzes. This cannot be undone.', [
+    { text: 'Cancel', style: 'cancel' }, { text: 'Delete', style: 'destructive', onPress: () => deleteClass(x.id) }]);
   const removeFromClass = (classId, sid) => upd((d) => { const cl = byId(d.classes, classId); cl.s = cl.s.filter((x) => x !== sid); return d; });
   const saveEcr = (classId, r) => upd((d) => { d.ecr = d.ecr || {}; d.ecr[classId] = r; return d; });
   const setTos = (quizId, tos) => upd((d) => { byId(d.quizzes, quizId).tos = tos; return d; });
   const setRecSlot = (quizId, slot) => upd((d) => { byId(d.quizzes, quizId).rec = slot; return d; });
+  const addToClass = (classId, sid) => upd((d) => { const cl = byId(d.classes, classId); if (cl && !cl.s.includes(sid)) cl.s.push(sid); return d; });
+  const setQuizClasses = (quizId, ids) => upd((d) => { byId(d.quizzes, quizId).c = ids; return d; });
   const setKey = (qi, ci) => upd((d) => { byId(d.quizzes, det.id).key[qi] = ci; return d; });
-  const addStudent = (n) => upd((d) => { const id = freshId(d); d.students.push({ id, name: n }); byId(d.classes, det.id).s.push(id); return d; });
+  const addStudent = (n) => {
+    if (!checkStudent(students, '', n)) return false;
+    upd((d) => { const id = freshId(d); d.students.push({ id, name: n }); byId(d.classes, det.id).s.push(id); return d; });
+  };
   const quizCsv = (z) => shareCsv(z.n + '_scores', [['Student', 'ID', 'Score', 'Percent'], ...z.res.map((r) => [r.name, r.id, scoreOf(z, r) + '/' + z.f, Math.round((scoreOf(z, r) / z.f) * 100) + '%'])]);
 
   const card = (x, i, kind, sub, name) => (
-    <Pressable key={x.id} style={s.card} onPress={() => setDet({ k: kind, id: x.id })}>
+    <Pressable key={x.id} style={s.card} onPress={() => setDet({ k: kind, id: x.id })} onLongPress={kind === 'quiz' ? () => askDeleteQuiz(x) : kind === 'class' || kind === 'ecr' ? () => askDeleteClass(x) : undefined}>
       <View style={[s.stripe, { backgroundColor: PAL[i % 5] }]} />
       <Text style={s.sub}>{sub}</Text><Text style={s.cname} numberOfLines={2}>{name}</Text>
     </Pressable>
@@ -1120,7 +1401,7 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
           <Text style={s.sub2}>Tap the correct answer for each question. {keySet}/{z.f} set.</Text>
           <View style={s.list}>{z.key.map((a2, qi) => (
             <View key={qi} style={s.kr}><Text style={s.kn}>{qi + 1}</Text>
-              {LET.map((l, ci) => <Pressable key={l} onPress={() => setKey(qi, ci)} style={[s.kb, a2 === ci && s.kbOn]}><Text style={[s.txt, a2 === ci && { color: c.bg }]}>{l}</Text></Pressable>)}
+              {optsOf(z).map((l, ci) => <Pressable key={l} onPress={() => setKey(qi, ci)} style={[s.kb, a2 === ci && s.kbOn]}><Text style={[s.txt, a2 === ci && { color: c.bg }]}>{showL(z, l)}</Text></Pressable>)}
             </View>))}</View></View>;
       }
       if (v === 'review') {
@@ -1141,7 +1422,7 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
               <Btn s={s} label={'\u2039 Previous'} onPress={() => go2(-1)} style={{ flex: 1 }} />
               <Btn s={s} label={'Next \u203A'} onPress={() => go2(1)} style={{ flex: 1 }} />
             </View>) : null}
-          <PaperWho s={s} c={c} z={z} r={r} students={students} classes={classes} onEdit={(nm, id) => editPaper(z.id, r.uid, nm, id)} onRegister={(nm, id) => registerStudent(z.id, r.uid, nm, id)} />
+          <PaperWho s={s} c={c} z={z} r={r} students={students} classes={classes} onEdit={(nm, id) => editPaper(z.id, r.uid, nm, id)} onRegister={(nm, id) => registerStudent(z.id, r.uid, nm, id)} onAddToClass={addToClass} />
           <Text style={[s.sub2, { marginTop: 12 }]}>The scanned sheet. Green ring = correct answer. Red ring = wrong or missed.</Text>
           <ScanFull k={thumbKey(acct.id, r.uid)} z={z} paper={r} c={c} fallback={<View><Text style={s.sub2}>No scan picture was kept for this paper. This is a redraw of the answers.</Text><PaperView c={c} z={z} paper={r} /></View>} />
           <Btn s={s} label="Delete this paper" style={{ backgroundColor: c.red }} onPress={() => Alert.alert('Delete ' + r.name + "'s paper?", 'You can scan it again later.', [
@@ -1155,6 +1436,11 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
         const clash = cur ? quizzes.filter((q) => q.id !== z.id && q.rec && q.rec.term === cur.term && q.rec.comp === cur.comp && q.rec.i === cur.i && q.c.some((id) => z.c.includes(id))) : [];
         return <View>{bk('Quiz menu', () => to('menu'))}<Text style={s.h1}>Class record entry</Text>
           <Text style={s.sub2}>Choose where this quiz's scores go in the class record. After that, every scanned paper adds its score by itself, matched by student ID. No typing.</Text>
+          <Text style={s.lab}>Classes</Text>
+          <View style={s.chips}>{classes.length ? classes.map((x) => <Chip key={x.id} s={s} label={x.n} on={z.c.includes(x.id)} onPress={() => setQuizClasses(z.id, z.c.includes(x.id) ? z.c.filter((i) => i !== x.id) : [...z.c, x.id])} />) : <Text style={s.sub2}>No classes yet.</Text>}</View>
+          {z.res.length && z.res.some((r) => !classes.some((cl) => z.c.includes(cl.id) && cl.s.includes(r.id)))
+            ? <Text style={[s.sub2, { color: AMBER }]}>{z.res.filter((r) => !classes.some((cl) => z.c.includes(cl.id) && cl.s.includes(r.id))).length} of {z.res.length} papers belong to students who are not in the classes above. Their scores will not reach the class record.</Text>
+            : null}
           <Text style={s.lab}>Term</Text>
           <View style={s.chips}>{[1, 2, 3].map((n) => <Chip key={n} s={s} label={'Term ' + n} on={!!cur && cur.term === n} onPress={() => pickSlot({ term: n })} />)}</View>
           <Text style={s.lab}>Component</Text>
@@ -1171,16 +1457,6 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
           <Text style={s.sub2}>List each learning competency with the item numbers that test it, like the item placement column of your table. The app then shows which competencies the class learned least.</Text>
           <TosEditor s={s} c={c} z={z} quizzes={quizzes} onSave={(t) => setTos(z.id, t)} /></View>;
       }
-      if (v === 'comp') {
-        return <View>{bk('Quiz menu', () => to('menu'))}<Text style={s.h1}>Competency Analysis</Text>
-          <Text style={s.sub2}>Quiz: {z.n}. Mastered means {MASTERY}% or more correct answers on the items of that competency.</Text>
-          <CompAnalysis s={s} c={c} z={z} classes={classes} onTos={() => to('tos')} /></View>;
-      }
-      if (v === 'indiv') {
-        return <View>{bk('Quiz menu', () => to('menu'))}<Text style={s.h1}>Individual Scores</Text>
-          <Text style={s.sub2}>Quiz: {z.n}. Taken from the item analysis. Every scanned paper counts as one case.</Text>
-          <IndivScores s={s} c={c} z={z} classes={classes} /></View>;
-      }
       if (v === 'item') {
         return <View>{bk('Quiz menu', () => to('menu'))}<Text style={s.h1}>Item Analysis</Text>
           <Text style={s.sub2}>Quiz: {z.n}</Text>
@@ -1194,12 +1470,15 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
       const focusStat = competencyStats(z).find((x) => !x.mastered) || null;
       const cls = z.c.map((id) => byId(classes, id)).filter(Boolean).map((x) => x.n).join(', ');
       return <View>{back}<Text style={s.h1}>{z.n}</Text>
+        <RenameBar s={s} c={c} value={z.n} label="Quiz name" onSave={(n) => renameQuiz(z.id, n)} />
         <View style={s.sg}>{[['details', 'Details'], ['stats', 'Statistics']].map(([k, l]) => (
           <Pressable key={k} style={[s.sgB, qtab === k && s.sgOn]} onPress={() => setQtab(k)}><Text style={s.sgT}>{l}</Text></Pressable>))}</View>
         {qtab === 'details' ? (
           <View>
             <View style={s.list}>
               <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Questions</Text><Text style={s.txt}>{z.f}</Text></View>
+              <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Choices</Text><Text style={s.txt}>{CHOICE_NAMES[z.ch] || 'A – E'}</Text></View>
+              <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Answer sheet</Text><Text style={s.txt}>{formOf(z)}-question form</Text></View>
               <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Papers</Text><Text style={s.txt}>{z.res.length}</Text></View>
               <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Answer key</Text><Text style={[s.txt, keySet < z.f && { color: c.red }]}>{keySet}/{z.f} set</Text></View>
               <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Classes</Text><Text style={[s.txt, { flexShrink: 1, textAlign: 'right' }]}>{cls || 'None'}</Text></View>
@@ -1223,10 +1502,9 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
         <MenuBtn s={s} c={c} icon="camera-outline" label="Scan Papers" onPress={() => openScan(z.id)} />
         <MenuBtn s={s} c={c} icon="document-text-outline" label="Review Papers" onPress={() => to('review')} />
         <MenuBtn s={s} c={c} icon="bar-chart-outline" label="Item Analysis" onPress={() => to('item')} />
-        <MenuBtn s={s} c={c} icon="grid-outline" label="Individual Scores (MPS)" onPress={() => to('indiv')} />
         <MenuBtn s={s} c={c} icon="list-outline" label="Table of Specification" onPress={() => to('tos')} />
-        <MenuBtn s={s} c={c} icon="analytics-outline" label="Competency Analysis" onPress={() => to('comp')} />
         <MenuBtn s={s} c={c} icon="link-outline" label="Class record entry" onPress={() => to('rec')} />
+        <Btn s={s} label="Delete this quiz" style={{ backgroundColor: c.red, marginTop: 16 }} onPress={() => askDeleteQuiz(z)} />
       </View>;
     }
     if (det && det.k === 'ecr') {
@@ -1236,20 +1514,36 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
     if (det && det.k === 'account') {
       return <View>{back}<Text style={s.h1}>Account</Text>
         <AccountPage s={s} c={c} acct={acct} stats={{ quizzes: quizzes.length, classes: classes.length, students: students.length, papers: quizzes.reduce((n, q) => n + q.res.length, 0) }}
-          onSave={onAccount} onLogout={onLogout} onDelete={onDelete} /></View>;
+          onSave={onAccount} onLogout={onLogout} onDelete={onDelete} onSync={() => doSync(true)} /></View>;
     }
     if (det && det.k === 'class') {
       const x = byId(classes, det.id); if (!x) return null;
       const list = x.s.map((id) => byId(students, id)).filter(Boolean);
-      return <View>{back}<Text style={s.h1}>{x.n}</Text><Text style={s.sub2}>Created {x.d}. Tap a student to rename them or change their ID. Each student fills in their ID number on the sheet.</Text><Text style={s.sec}>Students</Text>
-        <View style={s.list}>{list.length ? list.map((st) => <StudentRow key={st.id} s={s} c={c} st={st} taken={(i) => students.some((x) => x.id === i)} onSave={updStudent} onRemove={(sid) => removeFromClass(x.id, sid)} />) : <Text style={s.empty}>No students yet.</Text>}</View>
-        <AddRow s={s} c={c} placeholder="New student name" onAdd={addStudent} /></View>;
+      return <View>{back}<Text style={s.h1}>{x.n}</Text><RenameBar s={s} c={c} value={x.n} label="Class name" onSave={(n) => renameClass(x.id, n)} /><Text style={s.sub2}>Created {x.d}. Tap a student to rename them or change their ID. Each student fills in their ID number on the sheet.</Text><Text style={s.sec}>Students</Text>
+        <View style={s.list}>{list.length ? list.map((st) => <StudentRow key={st.id} s={s} c={c} st={st} clash={(i, n) => studentConflict(students, i, n, st.id)} onSave={updStudent} onRemove={(sid) => removeFromClass(x.id, sid)} />) : <Text style={s.empty}>No students yet.</Text>}</View>
+        <AddRow s={s} c={c} placeholder="New student name" onAdd={addStudent} />
+        <Btn s={s} label="Delete this class" style={{ backgroundColor: c.red, marginTop: 16 }} onPress={() => askDeleteClass(x)} /></View>;
     }
     if (det && det.k === 'sheet') {
       const z = byId(quizzes, det.id); if (!z) return null;
-      return <View>{back}<Text style={s.h1}>{z.sh}</Text><Text style={s.sub2}>From quiz: {z.n}</Text>
+      const sv = det.v || 'main';
+      const toS = (nv) => setDet({ k: 'sheet', id: z.id, v: nv });
+      const bkS = <Pressable onPress={() => toS('main')}><Text style={s.back}>{'\u2190'} {z.sh}</Text></Pressable>;
+      if (sv === 'indiv') {
+        return <View>{bkS}<Text style={s.h1}>Individual Scores</Text>
+          <Text style={s.sub2}>Quiz: {z.n}. Taken from the item analysis. Every scanned paper counts as one case.</Text>
+          <IndivScores s={s} c={c} z={z} classes={classes} /></View>;
+      }
+      if (sv === 'comp') {
+        return <View>{bkS}<Text style={s.h1}>Competency Analysis</Text>
+          <Text style={s.sub2}>Quiz: {z.n}. Mastered means {MASTERY}% or more correct answers on the items of that competency.</Text>
+          <CompAnalysis s={s} c={c} z={z} classes={classes} onTos={() => setDet({ k: 'quiz', id: z.id, v: 'tos' })} /></View>;
+      }
+      return <View>{back}<Text style={s.h1}>{z.sh}</Text><RenameBar s={s} c={c} value={z.sh} label="Spreadsheet name" onSave={(n) => renameSheet(z.id, n)} /><Text style={s.sub2}>From quiz: {z.n}</Text>
         <View style={s.list}>{z.res.length ? z.res.map((r) => <Row key={r.uid} a={r.name} b={scoreOf(z, r) + '/' + z.f + '   ' + Math.round((scoreOf(z, r) / z.f) * 100) + '%'} />) : <Text style={s.empty}>No papers scanned yet.</Text>}</View>
-        <Btn s={s} label="Share as CSV file" onPress={() => quizCsv(z)} /></View>;
+        <Btn s={s} label="Share as CSV file" onPress={() => quizCsv(z)} />
+        <MenuBtn s={s} c={c} icon="grid-outline" label="Individual Scores (MPS)" onPress={() => toS('indiv')} />
+        <MenuBtn s={s} c={c} icon="analytics-outline" label="Competency Analysis" onPress={() => toS('comp')} /></View>;
     }
     if (det && det.k === 'page') {
       const p = det.p; let inner;
@@ -1258,10 +1552,21 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
         ['What ID do students fill in?', 'Each student has an ID number shown in their class. They fill it in the ID grid.'],
         ['Where are scores saved?', 'Each quiz has a spreadsheet with one row per student, under Spreadsheet.']].map((x) => <View key={x[0]} style={s.li2}><Text style={s.qq}>{x[0]}</Text><Text style={s.sub2}>{x[1]}</Text></View>)}</View>;
       else if (p === 'Contact GuroGabay') inner = <Contact s={s} c={c} />;
-      else if (p === 'Settings') inner = <Text style={s.sub2}>The theme follows your phone's light or dark setting.</Text>;
-      else inner = <Text style={s.sub2}>GuroGabay is a quiz grading app for teachers. Add your team and the tools you used here.</Text>;
+      else if (p === 'Settings') inner = <SettingsPanel c={c} mode={mode} onMode={onMode} />;
+     else if (p === 'Credits') inner = <CreditsPanel c={c} />;
+      else inner = null;
       return <View>{back}<Text style={s.h1}>{p}</Text>{inner}</View>;
     }
+    // Students tab: every student with only their name, ID and the class(es) they belong to
+    const studentRows = students.map((st) => ({ st, cls: classes.filter((x) => x.s.includes(st.id)).map((x) => x.n) }))
+      .filter(({ st, cls }) => m(st.name) || m(String(st.id)) || cls.some(m))
+      .sort((a, b) => a.st.name.localeCompare(b.st.name));
+    const studentList = <View style={s.list}>{studentRows.length ? studentRows.map(({ st, cls }) => (
+      <View key={st.id} style={[s.li, { alignItems: 'center' }]}>
+        <View style={{ flex: 1 }}><Text style={s.txt} numberOfLines={1}>{st.name}</Text><Text style={{ color: c.mute, fontSize: 14 }} numberOfLines={1}>{cls.length ? cls.join(', ') : 'No class'}</Text></View>
+        <Text style={s.txt}>ID {st.id}</Text>
+        <Pressable onPress={() => askDeleteStudent(st)} hitSlop={10} accessibilityLabel={'Delete ' + st.name}><Ionicons name="trash-outline" size={20} color={c.red} /></Pressable>
+      </View>)) : <Text style={s.empty}>{q.trim() ? 'No matching students.' : 'No students yet. Add them inside a class.'}</Text>}</View>;
     let items = [];
     if (tab === 'home') items = quizzes.filter((x) => m(x.n)).map((x, i) => card(x, i, 'quiz', 'Papers: ' + x.res.length + '\n' + x.d, x.n));
     if (tab === 'sheet') items = stab === 'ecr' ? classes.filter((x) => m(x.n)).map((x, i) => card(x, i, 'ecr', x.s.length + ' learners', x.n))
@@ -1270,7 +1575,10 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
     return <View><Text style={s.h1}>{TITLES[tab]}</Text>
       {tab === 'sheet' ? <View style={s.sg}>{[['quiz', 'Quiz sheets'], ['ecr', 'Class records']].map(([k, l]) => (
         <Pressable key={k} style={[s.sgB, stab === k && s.sgOn]} onPress={() => setStab(k)}><Text style={s.sgT}>{l}</Text></Pressable>))}</View> : null}
-      {tab === 'recent' ? <View style={s.list}>{log.filter((e) => m(e.t)).length ? log.filter((e) => m(e.t)).map((e, i) => <Row key={i} a={e.t} b={e.d} />) : <Text style={s.empty}>No recent activity.</Text>}</View>
+      {tab === 'classes' ? <View style={s.sg}>{[['classes', 'Classes'], ['students', 'Students']].map(([k, l]) => (
+        <Pressable key={k} style={[s.sgB, ctab === k && s.sgOn]} onPress={() => setCtab(k)}><Text style={s.sgT}>{l}</Text></Pressable>))}</View> : null}
+      {tab === 'classes' && ctab === 'students' ? studentList : null}
+      {tab === 'classes' && ctab === 'students' ? null : tab === 'recent' ? <View style={s.list}>{log.filter((e) => m(e.t)).length ? log.filter((e) => m(e.t)).map((e, i) => <Row key={i} a={e.t} b={e.d} />) : <Text style={s.empty}>No recent activity.</Text>}</View>
         : items.length ? <View style={s.grid}>{items}</View> : tab === 'sheet' && stab === 'ecr' ? <Text style={s.empty}>Create a class on the Classes tab first.</Text> : empty}</View>;
   };
 
@@ -1298,17 +1606,11 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
           <Ionicons name="search" size={22} color={c.ink} /></View>
         <Pressable style={s.cam} onPress={() => openScan()} accessibilityLabel="Scan papers"><Ionicons name="camera" size={24} color={c.ink} /></Pressable>
       </View>
-      <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 130 + (BOTTOM - 18) }} keyboardShouldPersistTaps="handled">{body()}</ScrollView>
+      <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 130 + (BOTTOM - 18) }} keyboardShouldPersistTaps="handled"><Animated.View key={tab + (det ? ':' + det.k + (det.id || det.p || '') : '')} entering={FadeInRight.duration(250)}>{body()}</Animated.View></ScrollView>
 
-      <View style={s.nav}>
-        {['home', 'classes', 'add', 'sheet', 'recent'].map((k) => k === 'add'
-          ? <Pressable key={k} style={s.addBtn} onPress={plus} accessibilityLabel="Create"><Ionicons name="add" size={30} color={c.bg} /></Pressable>
-          : <Pressable key={k} style={s.navBtn} onPress={() => go(k)} accessibilityLabel={TITLES[k]}><Ionicons name={ICONS[k]} size={28} color={tab === k && !det ? c.ink : c.mute} /></Pressable>)}
-      </View>
+      <NavBar s={s} c={c} tab={tab} det={det} go={go} plus={plus} />
 
-      <Modal transparent animationType="fade" visible={menu} onRequestClose={() => setMenu(false)} statusBarTranslucent>
-        <View style={s.menuWrap}>
-          <View style={s.drawer}>
+      <SideMenu s={s} visible={menu} onClose={() => setMenu(false)}>
             <View style={s.brand}><Ionicons name="grid-outline" size={30} color={c.ink} /><Text style={s.brandT}>GuroGabay</Text></View>
             <Pressable style={s.acctRow} onPress={() => { setMenu(false); setDet({ k: 'account' }); }}>
               <View style={s.avatar}><Text style={{ color: c.bg, fontSize: 20, fontWeight: '700' }}>{(acct.name || '?').trim().charAt(0).toUpperCase()}</Text></View>
@@ -1324,14 +1626,11 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
               <Pressable key={x} style={s.item} onPress={() => { setMenu(false); setDet({ k: 'page', p: x }); }}><Text style={s.itemT}>{x}</Text></Pressable>))}
             <View style={{ flex: 1 }} />
             <Pressable style={[s.item, { marginBottom: BOTTOM + 8 }]} onPress={() => { setMenu(false); onLogout(); }}><Ionicons name="log-out-outline" size={26} color={c.red} /><Text style={[s.itemT, { color: c.red }]}>Log out</Text></Pressable>
-          </View>
-          <Pressable style={s.scrim} onPress={() => setMenu(false)} accessibilityLabel="Close menu" />
-        </View>
-      </Modal>
+      </SideMenu>
 
       <Modal transparent animationType="fade" visible={modal === 'quiz' || modal === 'class'} onRequestClose={() => setModal(null)}>
         <View style={s.dim}><KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-          {modal === 'quiz' && <QuizForm s={s} c={c} classes={classes} onSave={saveQuiz} onCancel={() => setModal(null)} />}
+          {modal === 'quiz' && <QuizForm s={s} c={c} classes={classes} quizzes={quizzes} onSave={saveQuiz} onCancel={() => setModal(null)} />}
           {modal === 'class' && <ClassForm s={s} c={c} students={students} classes={classes} onSave={saveClass} onCancel={() => setModal(null)} />}
         </KeyboardAvoidingView></View>
       </Modal>
@@ -1340,11 +1639,22 @@ function Main({ acct, onAccount, onLogout, onDelete }) {
 }
 
 // Decides what to show: the sign-in screen, or the app for the signed-in teacher. Accounts are kept in Supabase.
-export default function Root() {
-  const scheme = useColorScheme();
-  const c = scheme === 'dark' ? DARK : LIGHT;
-  const s = useMemo(() => mk(c), [scheme]);
-  const [boot, setBoot] = useState(false); const [user, setUser] = useState(null);
+function RootInner() {
+
+const sysScheme = useColorScheme();
+const [mode, setMode] = useState('system'); // 'system' | 'light' | 'dark'
+useEffect(() => {
+  AsyncStorage.getItem('gg_theme_mode').then((v) => v && setMode(v)).catch(() => {});
+}, []);
+const changeMode = (m) => {
+  setMode(m);
+  AsyncStorage.setItem('gg_theme_mode', m).catch(() => {});
+};
+const scheme = mode === 'system' ? sysScheme : mode;
+const c = scheme === 'dark' ? DARK : LIGHT;
+const s = useMemo(() => mk(c), [scheme]);
+const [boot, setBoot] = useState(false); const [user, setUser] = useState(null);
+const resetting = useRef(false);
 
   // Before accounts moved online, each teacher's data was saved under a phone-only id. Copy it to the online account with the same email.
   const adoptLocalData = async (u) => {
@@ -1374,7 +1684,7 @@ export default function Root() {
       } catch (e) { /* show the sign-in screen */ }
       if (alive) setBoot(true);
     })();
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, sess) => { if (alive) setUser(sess ? sess.user : null); });
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, sess) => { if (!alive || resetting.current) return; setUser(sess ? sess.user : null); });
     return () => { alive = false; sub.subscription.unsubscribe(); };
   }, []);
 
@@ -1393,6 +1703,21 @@ export default function Root() {
     if (error) return error.message;
     if (!data.session) return 'Account created. Check your email to confirm it, then sign in.';
     await adoptLocalData(data.user); setUser(data.user); return '';
+  };
+  const sendCode = async (email) => {
+    const { error } = await supabase.auth.resetPasswordForEmail(email.trim());
+    return error ? error.message : '';
+  };
+  const resetPassword = async (email, code, pw) => {
+    resetting.current = true;
+    try {
+      const v = await supabase.auth.verifyOtp({ email: email.trim(), token: code.trim(), type: 'recovery' });
+      if (v.error) return 'Wrong or expired code.';
+      const u = await supabase.auth.updateUser({ password: pw });
+      if (u.error) { await supabase.auth.signOut(); return u.error.message; }
+      await adoptLocalData(u.data.user); setUser(u.data.user); return '';
+    } catch (e) { return 'Something went wrong. Try again.'; }
+    finally { resetting.current = false; }
   };
   const logout = () => { supabase.auth.signOut().then(() => setUser(null)).catch(() => setUser(null)); };
   const update = async (patch) => {
@@ -1423,8 +1748,18 @@ export default function Root() {
 
   if (!boot) return <View style={[s.root, { alignItems: 'center', justifyContent: 'center' }]}><ActivityIndicator color={c.ink} /></View>;
   if (!me) return (<View style={{ flex: 1, backgroundColor: c.bg }}><StatusBar barStyle={scheme === 'dark' ? 'light-content' : 'dark-content'} />
-    <AuthScreen s={s} c={c} onLogin={login} onRegister={register} /></View>);
-  return <Main key={me.id} acct={me} onAccount={update} onLogout={logout} onDelete={remove} />;
+    <AuthScreen s={s} c={c} onLogin={login} onRegister={register} onSendCode={sendCode} onReset={resetPassword} /></View>);
+  return <Main key={me.id} acct={me} onAccount={update} onLogout={logout} onDelete={remove} scheme={scheme} mode={mode} onMode={changeMode} />;
+}
+
+export default function Root() {
+  const [showSplash, setShowSplash] = useState(true);
+  return (
+    <View style={{ flex: 1 }}>
+      <RootInner />
+      {showSplash && <SplashAnimation onDone={() => setShowSplash(false)} />}
+    </View>
+  );
 }
 
 const mk = (c) => StyleSheet.create({
@@ -1460,7 +1795,10 @@ const mk = (c) => StyleSheet.create({
   pill: { marginTop: 14, marginHorizontal: 6, height: 48, paddingHorizontal: 22, borderRadius: 24, backgroundColor: c.ink, alignItems: 'center', justifyContent: 'center' },
   pillT: { color: c.bg, fontSize: 16, fontWeight: '700' },
   addrow: { flexDirection: 'row', gap: 8, marginTop: 14 },
-  nav: { position: 'absolute', left: 20, right: 20, bottom: BOTTOM, height: 64, backgroundColor: c.card, borderWidth: 1.5, borderColor: c.mute, borderRadius: 32, flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center', elevation: 8 },
+  nav: { position: 'absolute', left: 20, right: 20, bottom: BOTTOM, height: 76, backgroundColor: c.card, borderWidth: 1, borderColor: c.mute, borderRadius: 38, padding: 8, shadowColor: '#000', shadowOpacity: 0.12, shadowRadius: 14, shadowOffset: { width: 0, height: 6 }, elevation: 10 },
+  navTrack: { flex: 1, borderRadius: 30, backgroundColor: c.bg, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 4, borderWidth: 1, borderColor: 'rgba(0,0,0,0.08)', borderTopWidth: 2, borderTopColor: 'rgba(0,0,0,0.2)' },
+  navPill: { position: 'absolute', left: 0, top: 4, bottom: 4, borderRadius: 26, backgroundColor: c.card, borderWidth: 1, borderColor: 'rgba(0,0,0,0.1)', shadowColor: '#000', shadowOpacity: 0.15, shadowRadius: 6, shadowOffset: { width: 0, height: 2 }, elevation: 3 },
+  navSlot: { flex: 1, height: '100%', alignItems: 'center', justifyContent: 'center' },
   navBtn: { width: 48, height: 48, alignItems: 'center', justifyContent: 'center' },
   addBtn: { width: 48, height: 48, borderRadius: 24, backgroundColor: c.ink, alignItems: 'center', justifyContent: 'center' },
   menuWrap: { flex: 1, flexDirection: 'row' },
