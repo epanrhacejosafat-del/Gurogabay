@@ -3,6 +3,9 @@ on: workflow_dispatch
 jobs:
   build:
     runs-on: macos-latest
+    env:
+      EXPO_PUBLIC_SUPABASE_URL: ${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}
+      EXPO_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
