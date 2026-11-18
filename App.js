@@ -15,6 +15,8 @@ import { supabase } from './lib/supabase';
 import { syncNow, markSaved } from './lib/sync';
 import { checkStudent, studentConflict } from './lib/duplicates';
 import { importTos } from './src/tosImport';
+import { buildMpsWorkbook } from './src/exportMps';
+import { pickStudentFile, fullName, nameParts } from './src/studentImport';
 import SettingsPanel from './SettingsPanel';
 import CreditsPanel from './CreditsPanel';
 import SplashAnimation from './SplashAnimation';
@@ -65,6 +67,12 @@ const fmtId = (n) => String(n).padStart(4, '0');
 function migrate(d) {
   d = { ...EMPTY, ...d };
   d.ecr = d.ecr || {};
+  // Students made on the website keep the name as { firstName, middleName, lastName }. The app uses text, so convert it.
+  d.students.forEach((st) => {
+    if (!st) return;
+    if (st.name && typeof st.name === 'object') { const n = st.name; st.first = n.firstName || ''; st.mid = n.middleName || ''; st.last = n.lastName || ''; st.name = fullName({ first: st.first, mid: st.mid, last: st.last }); }
+    else if (typeof st.name !== 'string') st.name = st.name == null ? '' : String(st.name);
+  });
   // drop students that have no real ID (they made two rows share the same key) and any repeated ID
   const seenId = new Set();
   d.students = d.students.filter((st) => { const i = st && st.id !== undefined && st.id !== null ? String(st.id).trim() : ''; if (!i || i === 'undefined' || i === 'null' || seenId.has(i)) return false; seenId.add(i); return true; });
@@ -481,6 +489,29 @@ async function shareCsv(name, rows) {
   } catch (e) { Alert.alert('Could not create the CSV file', String((e && e.message) || e)); }
 }
 
+// Saves a base64 string as a real .xlsx file and opens the share sheet.
+async function shareXlsx(name, b64) {
+  const file = String(name || 'export').replace(/[^\w\-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60) + '.xlsx';
+  try {
+    let uri;
+    if (FS.File && FS.Paths) { // current Expo file API
+      const f = new FS.File(FS.Paths.cache, file);
+      try { if (f.exists) f.delete(); } catch (e) { /* new file */ }
+      f.create(); f.write(Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0))); uri = f.uri;
+    } else { // older Expo versions
+      uri = FS.cacheDirectory + file; await FS.writeAsStringAsync(uri, b64, { encoding: 'base64' });
+    }
+    if (!(await Sharing.isAvailableAsync())) { Alert.alert('Sharing is not available on this device'); return; }
+    await Sharing.shareAsync(uri, { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', UTI: 'org.openxmlformats.spreadsheetml.sheet', dialogTitle: file });
+  } catch (e) { Alert.alert('Could not create the Excel file', String((e && e.message) || e)); }
+}
+// Heading and signature details for the MPS workbook: taken from the class record of the quiz's classes, then from the account.
+function mpsOpts(z, ecr, acct) {
+  const info = (z.c || []).map((id) => ecr && ecr[id] && ecr[id].info).find((i) => i && (i.school || i.teacher)) || {};
+  const d = new Date(); const y = d.getFullYear(); const start = d.getMonth() >= 5 ? y : y - 1; // school year starts in June
+  return { region: info.region, division: info.division, school: info.school || (acct && acct.school), subject: info.subject, teacher: info.teacher || (acct && acct.name), schoolYear: start + '-' + (start + 1) };
+}
+
 function useScan(k, uri) {
   const [src, setSrc] = useState(uri || thumbCache.get(k) || null);
   useEffect(() => {
@@ -594,6 +625,72 @@ function StudentRow({ s, c, st, clash, onSave, onRemove }) {
   );
 }
 
+// ---------------- Add one student / import a class list ----------------
+function AddStudentModal({ s, c, suggest, onAdd, onClose }) {
+  const [first, setFirst] = useState(''); const [mid, setMid] = useState(''); const [last, setLast] = useState(''); const [id, setId] = useState(suggest || '');
+  const go = () => {
+    if (!first.trim() || !last.trim()) return Alert.alert('Enter the first name and last name');
+    if (id && !/^\d{1,12}$/.test(id)) return Alert.alert('Student ID must be numbers only', 'The answer sheet can only read digits.');
+    if (onAdd({ first: first.trim(), mid: mid.trim(), last: last.trim(), id: id.trim() }) !== false) onClose();
+  };
+  return (
+    <Modal transparent animationType="fade" visible onRequestClose={onClose}>
+      <View style={s.dim}><KeyboardAvoidingView style={{ flex: 1, justifyContent: 'center' }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ flexGrow: 1, justifyContent: 'center' }}>
+          <View style={s.stuCard}>
+            <Text style={s.sec}>Add Student</Text>
+            <Field s={s} c={c} label="First name" value={first} onChangeText={setFirst} autoCapitalize="words" maxLength={40} />
+            <Field s={s} c={c} label="Middle name (optional)" value={mid} onChangeText={setMid} autoCapitalize="words" maxLength={40} />
+            <Field s={s} c={c} label="Last name" value={last} onChangeText={setLast} autoCapitalize="words" maxLength={40} />
+            <Field s={s} c={c} label="Student ID" value={id} onChangeText={(t) => setId(t.replace(/\D/g, ''))} keyboardType="number-pad" maxLength={12} placeholder="Leave blank for the next free ID" />
+            <View style={s.row}>
+              <Btn s={s} label="Add student" onPress={go} style={{ flex: 1 }} />
+              <Btn s={s} label="Cancel" onPress={onClose} style={{ flex: 1, backgroundColor: c.mute }} />
+            </View>
+          </View>
+        </ScrollView>
+      </KeyboardAvoidingView></View>
+    </Modal>
+  );
+}
+function ImportStudentsModal({ s, c, rows, students, onImport, onClose }) {
+  const [list, setList] = useState(() => rows.map((r) => ({ ...r, id: /^\d{1,3}$/.test(String(r.id || '')) ? String(r.id).padStart(4, '0') : String(r.id || '').trim() })));
+  const seenId = new Set(); const seenName = new Set();
+  const info = list.map((r) => {
+    if (!r.first || !r.last) return 'Missing name';
+    if (r.id && !/^\d{1,12}$/.test(r.id)) return 'ID must be numbers';
+    const nm = fullName(r); const nk = nm.toLowerCase();
+    const dup = studentConflict(students, r.id, nm) || ((r.id && seenId.has(r.id)) || seenName.has(nk) ? 'Repeated in this file' : '');
+    if (!dup) { if (r.id) seenId.add(r.id); seenName.add(nk); }
+    return dup || '';
+  });
+  const ok = list.filter((_, i) => !info[i]);
+  return (
+    <Modal transparent animationType="fade" visible onRequestClose={onClose}>
+      <View style={s.dim}><View style={[s.stuCard, { marginTop: TOP + 30, maxHeight: '82%' }]}>
+        <Text style={s.sec}>Import Students</Text>
+        <Text style={s.sub2}>{ok.length} of {list.length} are ready. Remove any row you do not want. IDs left blank get the next free ID.</Text>
+        <ScrollView style={{ marginTop: 6 }}>
+          {list.map((r, i) => (
+            <View key={i} style={[s.li, { alignItems: 'center' }]}>
+              <View style={{ flex: 1 }}>
+                <Text style={s.txt} numberOfLines={1}>{r.first || r.last ? fullName(r) : '(no name)'}</Text>
+                <Text style={[s.sub, { textAlign: 'left', color: info[i] ? c.red : c.mute }]}>{info[i] || 'Ready'}</Text>
+              </View>
+              <Text style={s.txt}>{r.id ? 'ID ' + r.id : 'Auto ID'}</Text>
+              <Pressable onPress={() => setList(list.filter((_, j) => j !== i))}><Ionicons name="close-circle-outline" size={22} color={c.mute} /></Pressable>
+            </View>
+          ))}
+        </ScrollView>
+        <View style={s.row}>
+          <Btn s={s} label={ok.length ? 'Import ' + ok.length : 'Nothing to import'} disabled={!ok.length} onPress={() => { onImport(ok); onClose(); }} style={{ flex: 1 }} />
+          <Btn s={s} label="Cancel" onPress={onClose} style={{ flex: 1, backgroundColor: c.mute }} />
+        </View>
+      </View></View>
+    </Modal>
+  );
+}
+
 // ---------------- Individual score + MPS (from the MPS workbook) ----------------
 const MONO = Platform.OS === 'ios' ? 'Menlo' : 'monospace';
 const pad3 = (v) => String(v).padStart(3, ' ');
@@ -602,13 +699,17 @@ function runs(marks) { // groups the 1s and 0s so a 100-item row is a few text s
   marks.forEach((m) => { const last = out[out.length - 1]; if (last && last.m === m) last.n += 1; else out.push({ m, n: 1 }); });
   return out;
 }
-function IndivScores({ s, c, z, classes }) {
+function IndivScores({ s, c, z, classes, ecr, acct }) {
   const d = useMemo(() => individualScores(z), [z]);
   const m = mpsSummary(d.rows.map((r) => r.total), z.f);
   if (!m) return <Text style={s.empty}>Scan some papers first.</Text>;
   const secs = useMemo(() => quizSections(z, classes), [z, classes]);
   const shareInd = () => shareCsv(z.n + '_individual-score', individualCsvRows(z, secs));
   const shareMps = () => shareCsv(z.n + '_MPS', mpsCsvRows(z, secs));
+  const shareMpsXlsx = async () => {
+    try { await shareXlsx(z.n + '_MPS-workbook', await buildMpsWorkbook(z, classes, mpsOpts(z, ecr, acct))); }
+    catch (e) { Alert.alert('Could not create the workbook', String((e && e.message) || e)); }
+  };
   const R = (a2, b) => <View key={a2} style={s.li}><Text style={[s.txt, { flex: 1 }]}>{a2}</Text><Text style={s.txt}>{b}</Text></View>;
   return (
     <View>
@@ -632,6 +733,7 @@ function IndivScores({ s, c, z, classes }) {
         </View>
       </ScrollView>
       <Btn s={s} label="Share individual score (CSV file)" onPress={shareInd} />
+      <Btn s={s} label="Share MPS workbook (Excel, print-ready)" onPress={shareMpsXlsx} />
       <Btn s={s} label="Share MPS (CSV file)" onPress={shareMps} />
       <Text style={s.sub2}>Each class that took this quiz becomes one section, laid out like your MPS workbook. Open the files in Excel or Google Sheets.</Text>
     </View>
@@ -1212,6 +1314,7 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
   const [ready, setReady] = useState(false);
   const [tab, setTab] = useState('home'); const [det, setDet] = useState(null);
   const [q, setQ] = useState(''); const [modal, setModal] = useState(null); const [menu, setMenu] = useState(false);
+  const [stuModal, setStuModal] = useState(null); const [impBusy, setImpBusy] = useState(false);
   const [scanQ, setScanQ] = useState(null); const [qtab, setQtab] = useState('details'); const [stab, setStab] = useState('quiz'); const [ctab, setCtab] = useState('classes');
   const dataKey = KEY + ':' + acct.id;
 
@@ -1304,7 +1407,7 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
   // Rename a student or change the student ID everywhere it is used.
   const updStudent = (oldId, name, newId) => upd((d) => {
     const st = d.students.find((x) => x.id === oldId); if (!st) return d;
-    st.name = name;
+    st.name = name; Object.assign(st, nameParts(name) || {});
     if (newId !== oldId) {
       st.id = newId;
       d.classes.forEach((cl) => { cl.s = cl.s.map((x) => (x === oldId ? newId : x)); });
@@ -1359,6 +1462,24 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
     if (!checkStudent(students, '', n)) return false;
     upd((d) => { const id = freshId(d); d.students.push({ id, name: n }); byId(d.classes, det.id).s.push(id); return d; });
   };
+  // Add one student (first / middle / last name + ID) to the open class.
+  const addStudentFull = (p) => {
+    const name = fullName(p);
+    if (!checkStudent(students, p.id, name)) return false;
+    upd((d) => { const sid = p.id || freshId(d); d.students.push({ id: sid, name, first: p.first, mid: p.mid, last: p.last }); const cl = byId(d.classes, det.id); if (cl && !cl.s.includes(sid)) cl.s.push(sid); return d; });
+  };
+  // Add the students from an imported file to the open class.
+  const importStudents = (list) => upd((d) => {
+    const cl = byId(d.classes, det.id);
+    list.forEach((p) => { const sid = p.id && !d.students.some((x) => x.id === p.id) ? p.id : freshId(d); d.students.push({ id: sid, name: fullName(p), first: p.first, mid: p.mid, last: p.last }); if (cl && !cl.s.includes(sid)) cl.s.push(sid); });
+    d.log.unshift({ t: 'Imported ' + list.length + ' students', d: today() }); return d;
+  });
+  const pickImport = async () => {
+    setImpBusy(true);
+    try { const rows = await pickStudentFile(); if (rows) setStuModal({ k: 'import', rows }); }
+    catch (e) { Alert.alert('Could not read the file', String((e && e.message) || e)); }
+    finally { setImpBusy(false); }
+  };
   const quizCsv = (z) => shareCsv(z.n + '_scores', [['Student', 'ID', 'Score', 'Percent'], ...z.res.map((r) => [r.name, r.id, scoreOf(z, r) + '/' + z.f, Math.round((scoreOf(z, r) / z.f) * 100) + '%'])]);
 
   const card = (x, i, kind, sub, name) => (
@@ -1367,7 +1488,7 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
       <Text style={s.sub}>{sub}</Text><Text style={s.cname} numberOfLines={2}>{name}</Text>
     </Pressable>
   );
-  const m = (t) => t.toLowerCase().includes(q.trim().toLowerCase());
+  const m = (t) => String(t ?? '').toLowerCase().includes(q.trim().toLowerCase());
   const empty = <Text style={s.empty}>Nothing here yet. Tap + to create one.</Text>;
   const back = <Pressable onPress={() => setDet(null)}><Text style={s.back}>{'\u2190'} Back</Text></Pressable>;
   const Row = ({ a, b }) => <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>{a}</Text><Text style={s.txt}>{b}</Text></View>;
@@ -1522,25 +1643,30 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
       const list = x.s.map((id) => byId(students, id)).filter(Boolean);
       return <View>{back}<Text style={s.h1}>{x.n}</Text><RenameBar s={s} c={c} value={x.n} label="Class name" onSave={(n) => renameClass(x.id, n)} /><Text style={s.sub2}>Created {x.d}. Tap a student to rename them or change their ID. Each student fills in their ID number on the sheet.</Text><Text style={s.sec}>Students</Text>
         <View style={s.list}>{list.length ? list.map((st) => <StudentRow key={st.id} s={s} c={c} st={st} clash={(i, n) => studentConflict(students, i, n, st.id)} onSave={updStudent} onRemove={(sid) => removeFromClass(x.id, sid)} />) : <Text style={s.empty}>No students yet.</Text>}</View>
-        <AddRow s={s} c={c} placeholder="New student name" onAdd={addStudent} />
+        <View style={s.row}>
+          <Btn s={s} label="Add student" onPress={() => setStuModal({ k: 'add' })} style={{ flex: 1 }} />
+          <Btn s={s} label={impBusy ? 'Reading…' : 'Import list'} disabled={impBusy} onPress={pickImport} style={{ flex: 1 }} />
+        </View>
+        {stuModal && stuModal.k === 'add' && <AddStudentModal s={s} c={c} suggest={freshId({ nextId: data.nextId || 0, students })} onAdd={addStudentFull} onClose={() => setStuModal(null)} />}
+        {stuModal && stuModal.k === 'import' && <ImportStudentsModal s={s} c={c} rows={stuModal.rows} students={students} onImport={importStudents} onClose={() => setStuModal(null)} />}
         <Btn s={s} label="Delete this class" style={{ backgroundColor: c.red, marginTop: 16 }} onPress={() => askDeleteClass(x)} /></View>;
     }
     if (det && det.k === 'sheet') {
       const z = byId(quizzes, det.id); if (!z) return null;
       const sv = det.v || 'main';
       const toS = (nv) => setDet({ k: 'sheet', id: z.id, v: nv });
-      const bkS = <Pressable onPress={() => toS('main')}><Text style={s.back}>{'\u2190'} {z.sh}</Text></Pressable>;
+      const bkS = <Pressable onPress={() => toS('main')}><Text style={s.back}>{'\u2190'} {z.sh || z.n}</Text></Pressable>;
       if (sv === 'indiv') {
         return <View>{bkS}<Text style={s.h1}>Individual Scores</Text>
           <Text style={s.sub2}>Quiz: {z.n}. Taken from the item analysis. Every scanned paper counts as one case.</Text>
-          <IndivScores s={s} c={c} z={z} classes={classes} /></View>;
+          <IndivScores s={s} c={c} z={z} classes={classes} ecr={data.ecr} acct={acct} /></View>;
       }
       if (sv === 'comp') {
         return <View>{bkS}<Text style={s.h1}>Competency Analysis</Text>
           <Text style={s.sub2}>Quiz: {z.n}. Mastered means {MASTERY}% or more correct answers on the items of that competency.</Text>
           <CompAnalysis s={s} c={c} z={z} classes={classes} onTos={() => setDet({ k: 'quiz', id: z.id, v: 'tos' })} /></View>;
       }
-      return <View>{back}<Text style={s.h1}>{z.sh}</Text><RenameBar s={s} c={c} value={z.sh} label="Spreadsheet name" onSave={(n) => renameSheet(z.id, n)} /><Text style={s.sub2}>From quiz: {z.n}</Text>
+      return <View>{back}<Text style={s.h1}>{z.sh || z.n}</Text><RenameBar s={s} c={c} value={z.sh || z.n} label="Spreadsheet name" onSave={(n) => renameSheet(z.id, n)} /><Text style={s.sub2}>From quiz: {z.n}</Text>
         <View style={s.list}>{z.res.length ? z.res.map((r) => <Row key={r.uid} a={r.name} b={scoreOf(z, r) + '/' + z.f + '   ' + Math.round((scoreOf(z, r) / z.f) * 100) + '%'} />) : <Text style={s.empty}>No papers scanned yet.</Text>}</View>
         <Btn s={s} label="Share as CSV file" onPress={() => quizCsv(z)} />
         <MenuBtn s={s} c={c} icon="grid-outline" label="Individual Scores (MPS)" onPress={() => toS('indiv')} />
@@ -1561,7 +1687,7 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
     // Students tab: every student with only their name, ID and the class(es) they belong to
     const studentRows = students.map((st) => ({ st, cls: classes.filter((x) => x.s.includes(st.id)).map((x) => x.n) }))
       .filter(({ st, cls }) => m(st.name) || m(String(st.id)) || cls.some(m))
-      .sort((a, b) => a.st.name.localeCompare(b.st.name));
+      .sort((a, b) => String(a.st.name || '').localeCompare(String(b.st.name || '')));
     const studentList = <View style={s.list}>{studentRows.length ? studentRows.map(({ st, cls }) => (
       <View key={st.id} style={[s.li, { alignItems: 'center' }]}>
         <View style={{ flex: 1 }}><Text style={s.txt} numberOfLines={1}>{st.name}</Text><Text style={{ color: c.mute, fontSize: 14 }} numberOfLines={1}>{cls.length ? cls.join(', ') : 'No class'}</Text></View>
@@ -1571,7 +1697,7 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
     let items = [];
     if (tab === 'home') items = quizzes.filter((x) => m(x.n)).map((x, i) => card(x, i, 'quiz', 'Papers: ' + x.res.length + '\n' + x.d, x.n));
     if (tab === 'sheet') items = stab === 'ecr' ? classes.filter((x) => m(x.n)).map((x, i) => card(x, i, 'ecr', x.s.length + ' learners', x.n))
-      : quizzes.filter((x) => m(x.sh)).map((x, i) => card(x, i, 'sheet', 'Rows: ' + x.res.length + '\n' + x.d, x.sh));
+      : quizzes.filter((x) => m(x.sh || x.n)).map((x, i) => card(x, i, 'sheet', 'Rows: ' + x.res.length + '\n' + x.d, x.sh || x.n));
     if (tab === 'classes') items = classes.filter((x) => m(x.n)).map((x, i) => card(x, i, 'class', x.d, x.n)).reverse();
     return <View><Text style={s.h1}>{TITLES[tab]}</Text>
       {tab === 'sheet' ? <View style={s.sg}>{[['quiz', 'Quiz sheets'], ['ecr', 'Class records']].map(([k, l]) => (
@@ -1813,6 +1939,7 @@ const mk = (c) => StyleSheet.create({
   mini: { width: 26, height: 26, borderRadius: 13, backgroundColor: c.ink, alignItems: 'center', justifyContent: 'center' },
   hr: { height: StyleSheet.hairlineWidth, backgroundColor: c.mute, marginVertical: 10 },
   dim: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)' },
+  stuCard: { marginHorizontal: 18, backgroundColor: c.card, borderWidth: 2, borderColor: c.ink, borderRadius: 26, padding: 22 },
   sheet: { flex: 1, marginTop: TOP + 56, marginHorizontal: 14, marginBottom: 40, backgroundColor: c.card, borderWidth: 2, borderColor: c.ink, borderRadius: 26, padding: 22 },
   bar: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 },
   cancel: { color: c.red, fontSize: 16 },
