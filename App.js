@@ -21,6 +21,7 @@ import SettingsPanel from './SettingsPanel';
 import CreditsPanel from './CreditsPanel';
 import SplashAnimation from './SplashAnimation';
 import Pressable from './PressableScale';
+import { timed, timedSync, logMs, nextPaper, exportPerf, now } from './perfLog';
 import Animated, { FadeInRight, Easing, runOnJS, useSharedValue, useAnimatedStyle, withTiming } from 'react-native-reanimated';
 
 
@@ -43,6 +44,10 @@ const TOP = Platform.OS === 'ios' ? (Dimensions.get('window').height >= 800 ? 56
 const BOTTOM = Platform.OS === 'ios' ? 30 : 18;
 const AMBER = '#d99a00';
 const SCAN_PX = 1200; // longest side of the photo that gets read. Lower = faster, higher = more accurate
+const SCAN_PX_RETRY = 1800; // if the sheet cannot be found at SCAN_PX, the same photo is tried once more at this size
+// Marks that are not a clean shaded bubble but where the app's best guess is almost always right. They are accepted automatically
+// (and still listed on the result screen so the teacher can change them). Rows with two real marks always need the teacher.
+const AUTO_OK = ['faint', 'cross', 'stray'];
 const A4 = 595 / 842;
 const LET = ['A', 'B', 'C', 'D', 'E'];
 // The scanner reads three printed sheet forms. A quiz of any size from 1 to 100 uses the smallest form that fits it.
@@ -207,7 +212,7 @@ function ClassForm({ s, c, students, classes, onSave, onCancel }) {
 
 function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose }) {
   const [perm, ask] = useCameraPermissions();
-  const cam = useRef(null);
+  const cam = useRef(null); const tTap = useRef(0);
   const [qid, setQid] = useState(initial || quizzes[0].id);
   const [phase, setPhase] = useState('camera'); // camera | busy | result
   const [err, setErr] = useState(''); const [note, setNote] = useState('');
@@ -215,8 +220,8 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
   const [box, setBox] = useState(null); const [dbg, setDbg] = useState(null);
   const fit = (e) => {
     const { width: W, height: H } = e.nativeEvent.layout;
-    let h = H * 0.96; let w = h * A4;
-    if (w > W * 0.96) { w = W * 0.96; h = w / A4; }
+    let h = H * 0.9; let w = h * A4; // a margin all round, so the stripes at the paper's edges are not cut off
+    if (w > W * 0.9) { w = W * 0.9; h = w / A4; }
     setBox({ x: (W - w) / 2, y: (H - h) / 2, w, h });
   };
   const z = quizzes.find((x) => x.id === qid);
@@ -225,26 +230,41 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
     const sub = BackHandler.addEventListener('hardwareBackPress', () => { onClose(); return true; });
     return () => sub.remove();
   }, [onClose]);
+  useEffect(() => {
+    if (phase === 'result' && tTap.current) { logMs('scan_tap_to_screen', now() - tTap.current); tTap.current = 0; }
+  }, [phase]);
 
   const snap = async () => {
     if (z.key.some((k) => k < 0)) { setErr('Set the answer key for this quiz first. Open the quiz and tap the correct answers.'); return; }
     setErr(''); setNote(''); setPhase('busy');
     try {
-      const t0 = Date.now();
-      const pic = await cam.current.takePictureAsync({ quality: 0.6, skipProcessing: true, shutterSound: false });
-      const k = SCAN_PX / Math.max(pic.width, pic.height);
-      const small = await manipulateAsync(pic.uri, [{ resize: { width: Math.round(pic.width * k) } }], { compress: 0.7, format: SaveFormat.JPEG });
-      await new Promise((r) => setTimeout(r, 0)); // let the "Reading" message show before the heavy work
-      const buf = await (await fetch(small.uri)).arrayBuffer();
-      const raw = jpeg.decode(new Uint8Array(buf), { useTArray: true });
-      const out = readPhoto(rgbaToGray(raw.data, raw.width, raw.height), raw.width, raw.height, LAYOUTS);
+      nextPaper(); tTap.current = now();
+      const pic = await timed('1_capture', () => cam.current.takePictureAsync({ quality: 0.6, skipProcessing: true, shutterSound: false }));
+      // Read at the normal size first (fast). If the sheet is not found, try the same photo once more at a larger size before asking for a retake.
+      const readAt = async (px) => {
+        const k = Math.min(1, px / Math.max(pic.width, pic.height));
+        const small = await timed('2_resize', () => manipulateAsync(pic.uri, [{ resize: { width: Math.round(pic.width * k) } }], { compress: 0.7, format: SaveFormat.JPEG }));
+        await new Promise((r) => setTimeout(r, 0)); // let the "Reading" message show before the heavy work
+        const raw = await timed('3_decode', async () => {
+          const buf = await (await fetch(small.uri)).arrayBuffer();
+          return jpeg.decode(new Uint8Array(buf), { useTArray: true });
+        });
+        return timedSync('4_omr_read', () => readPhoto(rgbaToGray(raw.data, raw.width, raw.height), raw.width, raw.height, LAYOUTS), 'items=' + z.f);
+      };
+      let out;
+      try { out = await readAt(SCAN_PX); }
+      catch (e) {
+        if (!(e instanceof ScanError) || Math.max(pic.width, pic.height) <= SCAN_PX * 1.15) throw e;
+        out = await readAt(SCAN_PX_RETRY);
+      }
       if (out.n !== formOf(z)) throw new ScanError(`This is a ${out.n}-question sheet, but this quiz needs the ${formOf(z)}-question sheet.`);
       if (out.answers.length > z.f) out.answers = out.answers.slice(0, z.f);
-      console.log('scan ms', Date.now() - t0);
-      setRes(out); setFix({}); setNameText('');
+      const auto = {}; out.answers.forEach((x) => { if (AUTO_OK.includes(x.status) && x.suggest) auto[x.q] = x.suggest; });
+      setRes(out); setFix(auto); setNameText('');
       setIdText(out.studentId.includes('?') ? '' : out.studentId);
       setPhase('result');
     } catch (e) {
+      if (tTap.current) { logMs('scan_failed', now() - tTap.current); tTap.current = 0; }
       console.log('scan error', e);
       setErr(e instanceof ScanError ? e.message : 'Could not read the photo: ' + ((e && e.message) || String(e)));
       if (e && e.debugUri) { setDbg({ uri: e.debugUri, ratio: e.debugRatio }); setPhase('fail'); } else setPhase('camera');
@@ -254,6 +274,7 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
   if (phase === 'result' && res) {
     const flagged = res.answers.filter((a2) => a2.status !== 'ok' && a2.status !== 'blank');
     const unresolved = flagged.filter((a2) => !fix[a2.q]);
+    const autoN = flagged.filter((a2) => AUTO_OK.includes(a2.status) && a2.suggest).length;
     const blanks = res.answers.filter((a2) => a2.status === 'blank').length;
     const letters = res.answers.map((a2) => (a2.status === 'ok' ? a2.choice[0] : fix[a2.q] ? (fix[a2.q] === 'X' ? '-' : fix[a2.q]) : a2.status === 'multiple' ? '?' : '-'));
     const score = letters.filter((l, i) => l === LET[z.key[i]]).length;
@@ -303,6 +324,7 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
             <View>
               <Text style={s.lab}>Check these answers ({unresolved.length} to confirm):</Text>
               <Text style={s.sub2}>Amber circles on the sheet below. The outlined letter is the app's best guess. "None" gives no credit.</Text>
+              {autoN ? <Text style={s.sub2}>{autoN} light or unusual mark{autoN > 1 ? 's were' : ' was'} accepted automatically. Tap a different letter to change {autoN > 1 ? 'them' : 'it'}.</Text> : null}
               {unresolved.some((a2) => a2.suggest) ? <Btn s={s} label="Accept all guesses" onPress={acceptAll} style={{ marginTop: 4 }} /> : null}
               {flagged.map((a2) => (
                 <View key={a2.q} style={{ marginTop: 10 }}>
@@ -370,7 +392,7 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
         <View style={[s.cv, s.center, { flex: 1 }]}><Text style={[s.sub, { marginBottom: 12, textAlign: 'center' }]}>Camera permission is needed to scan papers.</Text>
           <Btn s={s} label="Allow camera" onPress={ask} style={{ marginTop: 0 }} /></View>
       )}
-      <Text style={[s.sub, { marginTop: 8, textAlign: 'left' }]}>Line up the paper's four corners with the green corners. Keep it flat and well lit.</Text>
+      <Text onLongPress={exportPerf} style={[s.sub, { marginTop: 8, textAlign: 'left' }]}>Fit the whole sheet inside the green corners. It does not need to be straight, the app straightens the page itself. Keep it flat and well lit.</Text>
       {err ? <Text style={[s.sub, { color: c.red, textAlign: 'left', marginTop: 4 }]}>{err}</Text> : null}
       {note ? <Text style={[s.sub, { color: c.green, textAlign: 'left', marginTop: 4 }]}>{note}</Text> : null}
       <Btn s={s} label="Capture and grade" onPress={snap} disabled={phase === 'busy' || !(perm && perm.granted)} />
@@ -444,7 +466,7 @@ function PaperView({ c, z, paper }) {
 }
 
 function ItemAnalysis({ s, c, z }) {
-  const rows = useMemo(() => itemStats(z), [z]); const n = z.res.length; const BARH = 64;
+  const rows = useMemo(() => timedSync('item_analysis', () => itemStats(z), 'papers=' + z.res.length), [z]); const n = z.res.length; const BARH = 64;
   return (
     <View>
       <View style={s.iaH}>
@@ -1188,7 +1210,7 @@ function TosEditor({ s, c, z, quizzes, onSave }) {
 
 // Which competencies the class has learned least, from the scanned papers and the table of specification.
 function CompAnalysis({ s, c, z, classes, onTos }) {
-  const stats = useMemo(() => competencyStats(z), [z]); const [open, setOpen] = useState(null);
+  const stats = useMemo(() => timedSync('competency_analysis', () => competencyStats(z), 'papers=' + z.res.length), [z]); const [open, setOpen] = useState(null);
   const comps = (z.tos && z.tos.comps) || [];
   if (!comps.length) return <View><Text style={s.empty}>Add the table of specification first. It tells the app which items test which competency.</Text><Btn s={s} label="Open Table of Specification" onPress={onTos} /></View>;
   if (!stats.length) return <Text style={s.empty}>Scan some papers first.</Text>;
