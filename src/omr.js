@@ -524,6 +524,29 @@ function locate(norm, raw, w, h, layouts) {
   e.dbg = dbg; return e;
 }
 
+// How sharp the sheet looks: about 1 when crisp, under 0.5 when blurred (focus or motion). For every clear edge it compares the steepest
+// 1-pixel step with the whole step across 6 pixels. A crisp edge changes in one pixel, a blurred one is spread over many.
+function sharpness(g, w, h, quad) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  quad.forEach(([x, y]) => { x0 = Math.min(x0, x * w); x1 = Math.max(x1, x * w); y0 = Math.min(y0, y * h); y1 = Math.max(y1, y * h); });
+  const mx = (x1 - x0) * 0.15, my = (y1 - y0) * 0.15; // look at the middle of the sheet only
+  x0 = Math.max(4, Math.ceil(x0 + mx)); x1 = Math.min(w - 6, Math.floor(x1 - mx)); y0 = Math.max(4, Math.ceil(y0 + my)); y1 = Math.min(h - 6, Math.floor(y1 - my));
+  if (x1 - x0 < 40 || y1 - y0 < 40) return null;
+  const median = (bins, tot) => { let acc = 0; for (let i = 0; i < bins.length; i++) { acc += bins[i]; if (acc * 2 >= tot) return i / 100; } return 1; };
+  const bh = new Uint32Array(151), bv = new Uint32Array(151); let nh = 0, nv = 0;
+  for (let y = y0; y < y1; y += 2) {
+    const o = y * w;
+    for (let x = x0; x < x1; x++) {
+      const p = o + x, a = g[p], d = Math.abs(g[p + 1] - a);
+      if (d > 30 && d > Math.abs(a - g[p - 1]) && d >= Math.abs(g[p + 2] - g[p + 1])) { bh[Math.min(150, Math.floor((100 * d) / Math.max(1, Math.abs(g[p + 4] - g[p - 2]))))]++; nh++; }
+      const e = Math.abs(g[p + w] - a);
+      if (e > 30 && e > Math.abs(a - g[p - w]) && e >= Math.abs(g[p + 2 * w] - g[p + w])) { bv[Math.min(150, Math.floor((100 * e) / Math.max(1, Math.abs(g[p + 4 * w] - g[p - 2 * w]))))]++; nv++; }
+    }
+  }
+  if (nh < 150 || nv < 150) return 0.1; // almost no clear edges left on a sheet full of printing: very blurry
+  return Math.min(median(bh, nh), median(bv, nv));
+}
+
 function run(norm, raw, w, h, layouts) {
   const found = locate(norm, raw, w, h, layouts);
   if (found instanceof ScanError) throw found;
@@ -595,7 +618,11 @@ function run(norm, raw, w, h, layouts) {
     const lvl = Math.min(pct(fr, 0.5), empty + 0.08), r = pick(fr.map((v) => v - lvl));
     if (r.st === 'ok') studentId += r.on[0]; else if (r.st !== 'blank') studentId += '?';
   }
-  return { n, answers, studentId, reviewUri: scanImage(norm, w, h, Hi, lay), method: found.how };
+  // Where the sheet sits in the photo (corners as 0..1 of the photo, in sheet order) and how sharp it is. Auto-scan uses this to wait for a good picture.
+  const [PW, PH] = lay.page;
+  const quad = [[0, 0], [PW, 0], [PW, PH], [0, PH]].map(([x, y]) => { const p = apply(Hi, x * S, y * S); return [p[0] / w, p[1] / h]; });
+  let sharp = null; try { sharp = sharpness(raw || norm, w, h, quad); } catch (_) { /* optional */ }
+  return { n, answers, studentId, reviewUri: scanImage(norm, w, h, Hi, lay), method: found.how, geom: { quad, w, h, ratio: PH / PW, sharp } };
 }
 export function readSheet(gray, w, h, layouts, isNorm) {
   return isNorm ? run(gray, null, w, h, layouts) : run(normalize(gray, w, h), gray, w, h, layouts);
@@ -742,13 +769,13 @@ function debugImage({ norm, w, h, cands, L0, R0 }) {
 }
 // Reads a photo of a sheet. No need to turn it: the stripes are found wherever they are and whichever way up the sheet is.
 // The lighting fix is the slow part, so it runs once.
-export function readPhoto(gray, w, h, layouts) {
+export function readPhoto(gray, w, h, layouts, quiet) { // quiet = skip the debug picture on failure (used by auto-scan)
   const norm = normalize(gray, w, h);
   try { return run(norm, gray, w, h, layouts); }
   catch (e) {
     if (!(e instanceof ScanError)) throw e;
     if (e.dbg) {
-      try { const d = debugImage(e.dbg); e.debugUri = d.uri; e.debugRatio = d.ratio; } catch (_) { /* picture is optional */ }
+      if (!quiet) { try { const d = debugImage(e.dbg); e.debugUri = d.uri; e.debugRatio = d.ratio; } catch (_) { /* picture is optional */ } }
       delete e.dbg;
     }
     throw e;

@@ -2,6 +2,8 @@
 // Pure functions only. No student data lives here.
 
 const LET = ['A', 'B', 'C', 'D', 'E'];
+// A key entry is one choice index (-1 = not set) or a list of indices when several answers are accepted.
+export const keyLets = (k) => (Array.isArray(k) ? k : k >= 0 ? [k] : []).filter((x) => x >= 0).map((i) => LET[i]);
 const sum = (a) => a.reduce((x, y) => x + y, 0);
 export const r2 = (x) => Math.round(x * 100) / 100;
 
@@ -92,7 +94,7 @@ export function levelOf(pct) {
 // The "individual score" sheet: one row per learner, 1 = correct, 0 = wrong or blank, one column per item.
 export function individualScores(z) {
   const rows = z.res.map((r) => {
-    const marks = z.key.map((k, i) => (r.ans[i] === LET[k] ? 1 : 0));
+    const marks = z.key.map((k, i) => (keyLets(k).includes(r.ans[i]) ? 1 : 0));
     return { uid: r.uid, id: r.id, name: r.name, marks, total: sum(marks) };
   }).sort((a, b) => a.name.localeCompare(b.name));
   const cases = rows.length;
@@ -197,7 +199,7 @@ export function competencyStats(z) {
   if (!comps.length || !cases) return [];
   return comps.map((c, k) => {
     const items = c.items.map((it) => {
-      const wrong = {}; z.res.forEach((r) => { const m = r.ans[it - 1] || '-'; if (m !== LET[z.key[it - 1]]) wrong[m] = (wrong[m] || 0) + 1; });
+      const wrong = {}; z.res.forEach((r) => { const m = r.ans[it - 1] || '-'; if (!keyLets(z.key[it - 1]).includes(m)) wrong[m] = (wrong[m] || 0) + 1; });
       const top = Object.keys(wrong).sort((a, b) => wrong[b] - wrong[a])[0];
       return { item: it, pct: d.pct[it - 1], correct: d.correct[it - 1], wrongTop: top ? { l: top, n: wrong[top] } : null };
     });

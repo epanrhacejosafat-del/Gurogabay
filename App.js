@@ -6,6 +6,7 @@ import { AppState } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { Ionicons } from '@expo/vector-icons';
+import qrcode from 'qrcode-generator';
 import { readPhoto, fromBase64, rgbaToGray, ScanError } from './src/omr';
 import LAYOUTS from './src/layouts';
 import { TRACKS, NCOL, termCalc, finalCalc, individualScores, mpsSummary, LEVELS, csv as toCsv, quizSections, individualCsvRows, mpsCsvRows, TOS_LEVELS, MASTERY, parseItems, itemsText, tosCheck, competencyStats, tosCsvRows, competencyCsvRows } from './src/records';
@@ -101,7 +102,10 @@ function migrate(d) {
 }
 // A student id nobody uses yet.
 const freshId = (d) => { let id = fmtId(d.nextId++); while (d.students.some((st) => st.id === id)) id = fmtId(d.nextId++); return id; };
-const scoreOf = (z, r) => z.key.reduce((n, k, i) => n + (r.ans[i] === LET[k] ? 1 : 0), 0);
+// A key entry is one choice index (-1 = not set) or, when several answers are accepted, a list of indices.
+const keyList = (k) => (Array.isArray(k) ? k.filter((x) => x >= 0) : k >= 0 ? [k] : []);
+const keyLets = (k) => keyList(k).map((i) => LET[i]);
+const scoreOf = (z, r) => z.key.reduce((n, k, i) => n + (keyLets(k).includes(r.ans[i]) ? 1 : 0), 0);
 
 function Btn({ s, label, onPress, style, disabled }) {
   return <Pressable disabled={disabled} onPress={onPress} style={[s.pill, style, disabled && { opacity: 0.4 }]}><Text style={s.pillT}>{label}</Text></Pressable>;
@@ -210,6 +214,196 @@ function ClassForm({ s, c, students, classes, onSave, onCancel }) {
   );
 }
 
+// Auto-scan only accepts a sheet that is fully in view, big enough, centred, flat, sharp and still for two looks in a row. These numbers can be tuned.
+const ALIGN = { margin: 0.01, minArea: 0.3, maxArea: 0.97, center: 0.12, tilt: 0.8, shape: 0.15, steady: 0.015, sharpFloor: 0.55, sharpKeep: 0.75, sharpMin: 0.35 };
+const newSettle = () => ({ prev: null, ref: 0, floor: ALIGN.sharpFloor });
+// Returns { ok: true, out } when the picture can be trusted, otherwise { ok: false, hint } telling the teacher what to fix.
+function checkFrame(st, out, loose) {
+  const g = out.geom; if (!g) return { ok: true, out };
+  const q = g.quad; const D = Math.max(g.w, g.h); const px = q.map(([x, y]) => [x * g.w, y * g.h]);
+  const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+  const xs = q.map((p) => p[0]); const ys = q.map((p) => p[1]);
+  const area = Math.abs(q.reduce((t, p, i) => { const n = q[(i + 1) % 4]; return t + (p[0] * n[1] - n[0] * p[1]); }, 0)) / 2;
+  const cx = (xs[0] + xs[1] + xs[2] + xs[3]) / 4; const cy = (ys[0] + ys[1] + ys[2] + ys[3]) / 4;
+  const top = dist(px[0], px[1]); const bot = dist(px[3], px[2]); const left = dist(px[0], px[3]); const right = dist(px[1], px[2]);
+  const flat = Math.min(top, bot) / Math.max(top, bot) >= ALIGN.tilt && Math.min(left, right) / Math.max(left, right) >= ALIGN.tilt;
+  const shape = (left + right) / (top + bot) / (g.ratio || 1.414);
+  const fail = (hint) => { st.prev = null; return { ok: false, hint }; };
+  if (!loose && Math.min(...xs) < ALIGN.margin || Math.max(...xs) > 1 - ALIGN.margin || Math.min(...ys) < ALIGN.margin || Math.max(...ys) > 1 - ALIGN.margin) return fail('Move back so the whole sheet is in view.');
+  if (!loose && area < ALIGN.minArea) return fail('Move closer. Fit the sheet inside the green corners.');
+  if (!loose && area > ALIGN.maxArea) return fail('Move back a little.');
+  if (!loose && Math.abs(cx - 0.5) > ALIGN.center || Math.abs(cy - 0.5) > ALIGN.center) return fail('Center the sheet inside the green corners.');
+  if (!loose && (!flat || Math.abs(shape - 1) > ALIGN.shape)) return fail('Hold the phone flat above the sheet.');
+  const sh = g.sharp;
+  if (sh !== null && sh !== undefined) {
+    if (sh < Math.max(st.floor, ALIGN.sharpKeep * st.ref)) { // blurry: wait for a clearer picture (the bar slowly relaxes so it can never get stuck)
+      st.prev = null; st.ref *= 0.97; st.floor = Math.max(ALIGN.sharpMin, st.floor - 0.02);
+      return { ok: false, hint: 'Hold steady. The picture is blurry.' };
+    }
+    st.ref = Math.max(st.ref * 0.99, sh);
+  }
+  const moved = st.prev ? Math.max(...px.map((p, i) => dist(p, st.prev.px[i]))) / D : 1;
+  if (!st.prev || moved > ALIGN.steady) { st.prev = { px, out }; return { ok: false, hint: 'Hold steady...' }; }
+  const sharper = ((st.prev.out.geom && st.prev.out.geom.sharp) || 0) > (sh || 0) ? st.prev.out : out;
+  st.prev = null; st.floor = ALIGN.sharpFloor;
+  return { ok: true, out: sharper };
+}
+
+// Takes a photo and reads it. big = also try the larger size when the sheet is not found. quiet = no debug picture on failure.
+async function grabSheet(cam, f, form, big, quiet) {
+  const pic = await timed('1_capture', () => cam.current.takePictureAsync({ quality: 0.6, skipProcessing: true, shutterSound: false }));
+  // Read at the normal size first (fast). If the sheet is not found, try the same photo once more at a larger size before giving up.
+  const readAt = async (pxs) => {
+    const k = Math.min(1, pxs / Math.max(pic.width, pic.height));
+    const small = await timed('2_resize', () => manipulateAsync(pic.uri, [{ resize: { width: Math.round(pic.width * k) } }], { compress: 0.7, format: SaveFormat.JPEG }));
+    await new Promise((r) => setTimeout(r, 0)); // let the "Reading" message show before the heavy work
+    const raw = await timed('3_decode', async () => {
+      const buf = await (await fetch(small.uri)).arrayBuffer();
+      return jpeg.decode(new Uint8Array(buf), { useTArray: true });
+    });
+    return timedSync('4_omr_read', () => readPhoto(rgbaToGray(raw.data, raw.width, raw.height), raw.width, raw.height, LAYOUTS, quiet), 'items=' + f);
+  };
+  let out;
+  try { out = await readAt(SCAN_PX); }
+  catch (e) {
+    if (!big || !(e instanceof ScanError) || Math.max(pic.width, pic.height) <= SCAN_PX * 1.15) throw e;
+    out = await readAt(SCAN_PX_RETRY);
+  }
+  if (out.n !== form) { const mm = new ScanError(`This is a ${out.n}-question sheet, but this quiz needs the ${form}-question sheet.`); mm.mismatch = true; throw mm; }
+  if (out.answers.length > f) out.answers = out.answers.slice(0, f);
+  return out;
+}
+const notFoundHint = (e) => (/outside the photo/.test((e && e.message) || '') ? 'Move back so the whole sheet is in view.' : 'Fit the whole sheet inside the green corners.');
+
+// The green corner guide drawn over the camera.
+function GuideBox({ box }) {
+  if (!box) return null;
+  return (
+    <View pointerEvents="none" style={{ position: 'absolute', left: box.x, top: box.y, width: box.w, height: box.h, borderWidth: 1, borderColor: 'rgba(255,255,255,0.7)' }}>
+      {[{ top: -2, left: -2, borderTopWidth: 5, borderLeftWidth: 5 }, { top: -2, right: -2, borderTopWidth: 5, borderRightWidth: 5 },
+        { bottom: -2, left: -2, borderBottomWidth: 5, borderLeftWidth: 5 }, { bottom: -2, right: -2, borderBottomWidth: 5, borderRightWidth: 5 }]
+        .map((p, i) => <View key={i} style={[{ position: 'absolute', width: 34, height: 34, borderColor: '#22c55e' }, p]} />)}
+    </View>
+  );
+}
+
+// Reads a filled answer sheet (the teacher's reference copy) and turns the shaded answers into the key.
+// Works like continuous scanning: no button, the camera keeps looking, reads the sheet once it is clear and still,
+// then shows "Review Scanned Key" where the teacher saves it or captures again.
+function KeyScanModal({ s, c, z, onUse, onClose }) {
+  const [perm, ask] = useCameraPermissions();
+  const cam = useRef(null); const [box, setBox] = useState(null);
+  const [err, setErr] = useState(''); const [found, setFound] = useState(null); const [working, setWorking] = useState(false); const [dbg, setDbg] = useState(null);
+  const fit = (e) => {
+    const { width: W, height: H } = e.nativeEvent.layout;
+    let h = H * 0.9; let w = h * A4;
+    if (w > W * 0.9) { w = W * 0.9; h = w / A4; }
+    setBox({ x: (W - w) / 2, y: (H - h) / 2, w, h });
+  };
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => { onClose(); return true; });
+    return () => sub.remove();
+  }, [onClose]);
+  const makeKey = (out) => {
+    const nOpt = optsOf(z).length; const key = []; const missing = []; const multi = [];
+    out.answers.slice(0, z.f).forEach((a2, i) => {
+      let ls = [];
+      if (a2.status === 'ok') ls = a2.choice.slice(0, 1);
+      else if (a2.status === 'multiple') ls = a2.choice; // more than one shaded: every shaded answer is accepted
+      else if (AUTO_OK.includes(a2.status) && a2.suggest) ls = [a2.suggest];
+      const idx = ls.map((l) => LET.indexOf(l)).filter((x) => x >= 0 && x < nOpt).sort((x, y) => x - y);
+      if (!idx.length) { missing.push(i + 1); key.push(z.key[i]); } // not readable: keep what the key had
+      else { if (idx.length > 1) multi.push(i + 1); key.push(idx.length === 1 ? idx[0] : idx); }
+    });
+    return { key, missing, multi, read: z.f - missing.length, uri: out.reviewUri, qs: out.answers.slice(0, z.f).map((a2) => a2.q) };
+  };
+  const snapKey = async () => {
+    if (working) return;
+    setWorking(true); setErr(''); setDbg(null);
+    try {
+      const out = await grabSheet(cam, z.f, formOf(z), true, false);
+      setFound(makeKey(out));
+    } catch (e) {
+      console.log('key scan error', e);
+      setErr(e instanceof ScanError ? e.message : 'Could not read the photo: ' + ((e && e.message) || String(e)));
+      if (e && e.debugUri) setDbg({ uri: e.debugUri, ratio: e.debugRatio });
+    } finally { setWorking(false); }
+  };
+  const redo = () => { setFound(null); setErr(''); setDbg(null); };
+
+  if (found) {
+    const lay = LAYOUTS[formOf(z)]; const [PW, PH] = lay.page; const R = lay.answers.radius * 1.3;
+    const pos = {}; lay.answers.bubbles.forEach((b) => { (pos[b.q] = pos[b.q] || {})[b.choice] = b; });
+    const rings = [];
+    found.key.forEach((k, i) => { keyLets(k).forEach((l) => { const b = pos[found.qs[i]] && pos[found.qs[i]][l]; if (b) rings.push({ x: b.x, y: b.y }); }); });
+    return (
+      <View style={s.sheet}>
+        <Bar s={s} onCancel={onClose} cancelLabel="CLOSE" onSave={null} />
+        <Text style={s.h2}>Review Scanned Key</Text>
+        <ScrollView>
+          <Text style={s.sub2}>{found.read} of {z.f} answers read.{found.missing.length ? ' Not read, so kept as they were: ' + found.missing.join(', ') + '.' : ''}{found.multi.length ? ' More than one shaded answer (all accepted): ' + found.multi.join(', ') + '.' : ''}</Text>
+          <View style={{ width: '100%', aspectRatio: PW / PH, marginTop: 6 }}>
+            <Image source={{ uri: found.uri }} style={StyleSheet.absoluteFill} resizeMode="stretch" />
+            {rings.map((g, i) => (
+              <View key={i} pointerEvents="none" style={{
+                position: 'absolute', left: ((g.x - R) / PW) * 100 + '%', top: ((g.y - R) / PH) * 100 + '%',
+                width: ((2 * R) / PW) * 100 + '%', height: ((2 * R) / PH) * 100 + '%',
+                borderRadius: 999, borderWidth: 2.5, borderColor: c.green,
+              }} />
+            ))}
+          </View>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginVertical: 8 }}>
+            {found.key.map((k, i) => <Text key={i} style={[s.txt, { width: '25%', paddingVertical: 4 }]}>{i + 1}. {keyLets(k).map((l) => showL(z, l)).join('/') || '-'}</Text>)}
+          </View>
+        </ScrollView>
+        <View style={{ flexDirection: 'row', justifyContent: 'space-around', paddingVertical: 8 }}>
+          <Pressable onPress={() => onUse(found.key)}><Text style={s.save}>Save New Key</Text></Pressable>
+          <Pressable onPress={redo}><Text style={s.save}>Re-do Key Capture</Text></Pressable>
+        </View>
+      </View>
+    );
+  }
+  return (
+    <View style={s.sheet}>
+      <Bar s={s} onCancel={onClose} cancelLabel="CLOSE" onSave={null} />
+      <Text style={s.h2}>Scan the answer key sheet</Text>
+      {perm && perm.granted ? (
+        <View style={{ flex: 1 }} onLayout={fit}>
+          <CameraView ref={cam} style={{ flex: 1 }} facing="back" onMountError={(e) => setErr('Camera could not start: ' + ((e && e.message) || 'unknown error'))} />
+          <GuideBox box={box} />
+          <View pointerEvents="none" style={{ position: 'absolute', top: 8, alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.65)', paddingHorizontal: 14, paddingVertical: 6, borderRadius: 14 }}><Text style={{ color: '#fff' }}>Fit the whole sheet inside the green corners</Text></View>
+        </View>
+      ) : (
+        <View style={[s.cv, s.center, { flex: 1 }]}><Text style={[s.sub, { marginBottom: 12, textAlign: 'center' }]}>Camera permission is needed to scan.</Text>
+          <Btn s={s} label="Allow camera" onPress={ask} style={{ marginTop: 0 }} /></View>
+      )}
+      <Text style={[s.sub, { marginTop: 8, textAlign: 'left' }]}>Use a sheet where the correct answers are shaded. Hold the phone steady, then tap Scan answer key.</Text>
+      {err ? <Text style={[s.sub, { color: c.red, textAlign: 'left', marginTop: 4 }]}>{err}</Text> : null}
+      {dbg ? <Image source={{ uri: dbg.uri }} style={{ width: '100%', height: 140, marginTop: 6 }} resizeMode="contain" /> : null}
+      <Btn s={s} label={working ? 'Reading...' : 'Scan answer key'} onPress={snapKey} disabled={working || !(perm && perm.granted)} />
+    </View>
+  );
+}
+
+// Draws a QR code with plain views (no extra native module). Each run of dark squares in a row is one view.
+function QrView({ text, size = 260 }) {
+  const m = useMemo(() => {
+    const q = qrcode(0, 'M'); q.addData(text); q.make(); const n = q.getModuleCount(); const rows = [];
+    for (let r = 0; r < n; r++) {
+      const runs = []; let c = 0;
+      while (c < n) { if (q.isDark(r, c)) { let e = c; while (e + 1 < n && q.isDark(r, e + 1)) e++; runs.push([c, e - c + 1]); c = e + 1; } else c++; }
+      rows.push(runs);
+    }
+    return { n, rows };
+  }, [text]);
+  const u = Math.max(1, Math.floor(size / (m.n + 8))); const full = u * (m.n + 8); // 4 empty squares all round, so cameras can find the code
+  return (
+    <View style={{ width: full, height: full, backgroundColor: '#fff' }}>
+      {m.rows.map((runs, r) => runs.map(([c, len]) => <View key={r + '-' + c} style={{ position: 'absolute', left: (c + 4) * u, top: (r + 4) * u, width: len * u, height: u, backgroundColor: '#000' }} />))}
+    </View>
+  );
+}
+
 function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose }) {
   const [perm, ask] = useCameraPermissions();
   const cam = useRef(null); const tTap = useRef(0);
@@ -218,6 +412,18 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
   const [err, setErr] = useState(''); const [note, setNote] = useState('');
   const [res, setRes] = useState(null); const [fix, setFix] = useState({}); const [idText, setIdText] = useState(''); const [nameText, setNameText] = useState('');
   const [box, setBox] = useState(null); const [dbg, setDbg] = useState(null);
+  // Auto-scan: the camera keeps looking for a sheet, reads it when it finds one, saves it, pauses a few seconds, then looks for the next.
+  const auto = false; const [pause, setPause] = useState(3); const [status, setStatus] = useState('');
+  const qidRef = useRef(qid); qidRef.current = qid;
+  const pauseRef = useRef(pause); pauseRef.current = pause;
+  const busyRef = useRef(false); const lastSig = useRef(''); const gone = useRef(0); const misses = useRef(0); const unknownQr = useRef(''); const stepRef = useRef(null); const settle = useRef(newSettle());
+  useEffect(() => {
+    AsyncStorage.getItem('gurogabay:autoscan').then((v) => {
+      if (!v) return;
+      try { const o = JSON.parse(v); if (o.pause >= 2 && o.pause <= 5) setPause(o.pause); } catch (_) { /* keep defaults */ }
+    }).catch(() => {});
+  }, []);
+  const saveAuto = (a, p) => { const pp = Math.min(5, Math.max(2, p)); setPause(pp); AsyncStorage.setItem('gurogabay:autoscan', JSON.stringify({ auto: true, pause: pp })).catch(() => {}); };
   const fit = (e) => {
     const { width: W, height: H } = e.nativeEvent.layout;
     let h = H * 0.9; let w = h * A4; // a margin all round, so the stripes at the paper's edges are not cut off
@@ -234,35 +440,21 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
     if (phase === 'result' && tTap.current) { logMs('scan_tap_to_screen', now() - tTap.current); tTap.current = 0; }
   }, [phase]);
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const grab = (zq, big, quiet) => grabSheet(cam, zq.f, formOf(zq), big, quiet);
+  const show = (out) => {
+    const auto2 = {}; out.answers.forEach((x) => { if (AUTO_OK.includes(x.status) && x.suggest) auto2[x.q] = x.suggest; });
+    setRes(out); setFix(auto2); setNameText('');
+    setIdText(out.studentId.includes('?') ? '' : out.studentId);
+    setPhase('result');
+  };
+
   const snap = async () => {
-    if (z.key.some((k) => k < 0)) { setErr('Set the answer key for this quiz first. Open the quiz and tap the correct answers.'); return; }
+    if (z.key.some((k) => !keyList(k).length)) { setErr('Set the answer key for this quiz first. Open the quiz and tap the correct answers.'); return; }
     setErr(''); setNote(''); setPhase('busy');
     try {
       nextPaper(); tTap.current = now();
-      const pic = await timed('1_capture', () => cam.current.takePictureAsync({ quality: 0.6, skipProcessing: true, shutterSound: false }));
-      // Read at the normal size first (fast). If the sheet is not found, try the same photo once more at a larger size before asking for a retake.
-      const readAt = async (px) => {
-        const k = Math.min(1, px / Math.max(pic.width, pic.height));
-        const small = await timed('2_resize', () => manipulateAsync(pic.uri, [{ resize: { width: Math.round(pic.width * k) } }], { compress: 0.7, format: SaveFormat.JPEG }));
-        await new Promise((r) => setTimeout(r, 0)); // let the "Reading" message show before the heavy work
-        const raw = await timed('3_decode', async () => {
-          const buf = await (await fetch(small.uri)).arrayBuffer();
-          return jpeg.decode(new Uint8Array(buf), { useTArray: true });
-        });
-        return timedSync('4_omr_read', () => readPhoto(rgbaToGray(raw.data, raw.width, raw.height), raw.width, raw.height, LAYOUTS), 'items=' + z.f);
-      };
-      let out;
-      try { out = await readAt(SCAN_PX); }
-      catch (e) {
-        if (!(e instanceof ScanError) || Math.max(pic.width, pic.height) <= SCAN_PX * 1.15) throw e;
-        out = await readAt(SCAN_PX_RETRY);
-      }
-      if (out.n !== formOf(z)) throw new ScanError(`This is a ${out.n}-question sheet, but this quiz needs the ${formOf(z)}-question sheet.`);
-      if (out.answers.length > z.f) out.answers = out.answers.slice(0, z.f);
-      const auto = {}; out.answers.forEach((x) => { if (AUTO_OK.includes(x.status) && x.suggest) auto[x.q] = x.suggest; });
-      setRes(out); setFix(auto); setNameText('');
-      setIdText(out.studentId.includes('?') ? '' : out.studentId);
-      setPhase('result');
+      show(await grab(z, true, false));
     } catch (e) {
       if (tTap.current) { logMs('scan_failed', now() - tTap.current); tTap.current = 0; }
       console.log('scan error', e);
@@ -271,25 +463,84 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
     }
   };
 
+  // One round of auto-scan: look for a sheet; if found, read it (re-checking unclear marks), and save it when every answer is clear.
+  const autoStep = async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    try {
+      const zq = quizzes.find((x) => x.id === qidRef.current);
+      if (!zq) return;
+      if (zq.key.some((k) => !keyList(k).length)) { setErr('Set the answer key for this quiz first. Open the quiz and tap the correct answers.'); setStatus(''); return; }
+      nextPaper(); tTap.current = now();
+      const needsCheck = (o) => o.answers.filter((a2) => a2.status !== 'ok' && a2.status !== 'blank' && !(AUTO_OK.includes(a2.status) && a2.suggest)).length;
+      let out = await grab(zq, misses.current % 3 === 2, true); // every 3rd failed look also tries the larger size
+      misses.current = 0; gone.current = 0; setErr('');
+      // A real sheet = the printed side stripes were matched. Paper edges alone (a wall, a screen, a hand) or an empty page are ignored.
+      const noMarks = out.answers.every((a2) => a2.status === 'blank') && !/\d/.test(out.studentId || '');
+      if (out.method !== 'stripes' || !out.geom || noMarks) { settle.current.prev = null; lastSig.current = ''; setStatus('Place a paper inside the green corners.'); return; }
+      const v = checkFrame(settle.current, out); // only a sheet that is in place, sharp and still for two looks in a row is accepted
+      if (!v.ok) { setStatus(v.hint); return; }
+      out = v.out; setStatus('Reading...');
+      const sig = out.studentId + '|' + out.answers.map((a2) => (a2.status === 'ok' ? a2.choice[0] : a2.status === 'blank' ? '-' : '?')).join('');
+      if (sig === lastSig.current) { setStatus('Remove this paper and place the next one.'); return; } // same paper still in view
+      lastSig.current = sig;
+      if (needsCheck(out) > 0) { show(out); return; } // the teacher confirms unclear answers
+      const letters = out.answers.map((a2) => (a2.status === 'ok' ? a2.choice[0] : AUTO_OK.includes(a2.status) && a2.suggest ? a2.suggest : '-'));
+      const score = letters.filter((l, i) => keyLets(zq.key[i]).includes(l)).length;
+      const finalId = out.studentId.includes('?') ? '' : out.studentId.trim(); const reg = students.find((st) => st.id === finalId) || null;
+      const name = reg ? reg.name : finalId ? 'ID ' + finalId : 'Unnamed paper';
+      const again = finalId && zq.res.some((r) => r.id === finalId);
+      onSave(zq.id, { id: finalId, name, ans: letters.join(''), d: today(), thumb: out.reviewUri });
+      setNote(`Saved ${name}: ${score}/${zq.f}${reg ? '' : ' (not registered, you can assign it later)'}.${again ? ' Replaced the earlier paper.' : ''}`);
+      setStatus(`Saved ${name}: ${score}/${zq.f}`);
+      await sleep(pauseRef.current * 1000); // time to read the result and swap papers
+      setStatus('');
+    } catch (e) {
+      if (e instanceof ScanError) {
+        misses.current += 1; gone.current += 1; if (gone.current >= 2) lastSig.current = ''; // two misses in a row = the paper was taken away
+        settle.current.prev = null;
+        if (e.mismatch) setErr(e.message); else setErr('');
+        setStatus(notFoundHint(e));
+      } else { console.log('auto-scan error', e); setStatus('Could not read: ' + ((e && e.message) || String(e))); }
+    } finally { busyRef.current = false; }
+  };
+  stepRef.current = autoStep;
+  useEffect(() => {
+    if (!auto || phase !== 'camera' || !(perm && perm.granted)) return undefined;
+    let stop = false; let timer;
+    const tick = async () => { if (stop) return; await stepRef.current(); if (!stop) timer = setTimeout(tick, 500); };
+    timer = setTimeout(tick, 700);
+    return () => { stop = true; clearTimeout(timer); setStatus(''); };
+  }, [auto, phase, !!(perm && perm.granted)]);
+
+  // The QR code printed on a sheet names its quiz: the scanner switches to that quiz by itself.
+  const onQr = (e) => {
+    const m = /^GG1:(.+)$/.exec((e && e.data) || ''); if (!m || phase !== 'camera' || busyRef.current) return;
+    const q = quizzes.find((x) => x.id === m[1]);
+    if (!q) { if (unknownQr.current !== m[1]) { unknownQr.current = m[1]; setErr('This sheet belongs to a quiz that is not on this phone.'); } return; }
+    unknownQr.current = '';
+    if (q.id !== qidRef.current) { setQid(q.id); setErr(''); setNote('Quiz detected: ' + q.n); }
+  };
+
   if (phase === 'result' && res) {
     const flagged = res.answers.filter((a2) => a2.status !== 'ok' && a2.status !== 'blank');
     const unresolved = flagged.filter((a2) => !fix[a2.q]);
     const autoN = flagged.filter((a2) => AUTO_OK.includes(a2.status) && a2.suggest).length;
     const blanks = res.answers.filter((a2) => a2.status === 'blank').length;
     const letters = res.answers.map((a2) => (a2.status === 'ok' ? a2.choice[0] : fix[a2.q] ? (fix[a2.q] === 'X' ? '-' : fix[a2.q]) : a2.status === 'multiple' ? '?' : '-'));
-    const score = letters.filter((l, i) => l === LET[z.key[i]]).length;
+    const score = letters.filter((l, i) => keyLets(z.key[i]).includes(l)).length;
     const finalId = idText.trim(); const reg = students.find((st) => st.id === finalId) || null;
     const lay = LAYOUTS[formOf(z)]; const [PW, PH] = lay.page; const R = lay.answers.radius * 1.3;
     const pos = {}; lay.answers.bubbles.forEach((b) => { (pos[b.q] = pos[b.q] || {})[b.choice] = b; });
     const rings = [];
     res.answers.forEach((ans, i) => {
-      const right = LET[z.key[i]]; const L = letters[i];
+      const rights = keyLets(z.key[i]); const L = letters[i];
       const at = (ch, color, thin) => { const b = pos[ans.q] && pos[ans.q][ch]; if (b) rings.push({ x: b.x, y: b.y, color, thin }); };
       if (ans.status !== 'ok' && ans.status !== 'blank' && !fix[ans.q]) { (ans.status === 'multiple' ? ans.choice : [ans.suggest]).forEach((m) => m && at(m, AMBER)); return; }
       const marked = L === '?' || L === '-' ? [] : [L];
-      if (marked.length === 1 && marked[0] === right) at(right, c.green);
-      else if (marked.length) { marked.forEach((m) => at(m, c.red)); at(right, c.green, true); }
-      else at(right, c.red);
+      if (marked.length === 1 && rights.includes(marked[0])) at(marked[0], c.green);
+      else if (marked.length) { marked.forEach((m) => at(m, c.red)); rights.forEach((r) => at(r, c.green, true)); }
+      else rights.forEach((r) => at(r, c.red));
     });
     const pool = students.filter((st) => !z.c.length || classes.some((cl) => z.c.includes(cl.id) && cl.s.includes(st.id))).slice(0, 40);
     const save = () => {
@@ -302,7 +553,7 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
     const acceptAll = () => { const f = { ...fix }; unresolved.forEach((a2) => { if (a2.suggest) f[a2.q] = a2.suggest; }); setFix(f); };
     return (
       <View style={s.sheet}>
-        <Bar s={s} onCancel={() => { setPhase('camera'); setRes(null); }} cancelLabel="RETAKE" onSave={save} />
+        <Bar s={s} onCancel={() => { lastSig.current = ''; settle.current = newSettle(); setPhase('camera'); setRes(null); }} cancelLabel="RETAKE" onSave={save} />
         <ScrollView keyboardShouldPersistTaps="handled">
           <Text style={s.h2}>{reg ? reg.name : 'Student not registered'}</Text>
           <Text style={s.sub2}>Quiz: {z.n}. ID read from the sheet: {res.studentId || 'blank'}</Text>
@@ -378,7 +629,7 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
       </ScrollView>
       {perm && perm.granted ? (
         <View style={{ flex: 1 }} onLayout={fit}>
-          <CameraView ref={cam} style={{ flex: 1 }} facing="back" onMountError={(e) => setErr('Camera could not start: ' + ((e && e.message) || 'unknown error'))} />
+          <CameraView ref={cam} style={{ flex: 1 }} facing="back" barcodeScannerSettings={{ barcodeTypes: ['qr'] }} onBarcodeScanned={onQr} onMountError={(e) => setErr('Camera could not start: ' + ((e && e.message) || 'unknown error'))} />
           {box ? (
             <View pointerEvents="none" style={{ position: 'absolute', left: box.x, top: box.y, width: box.w, height: box.h, borderWidth: 1, borderColor: 'rgba(255,255,255,0.7)' }}>
               {[{ top: -2, left: -2, borderTopWidth: 5, borderLeftWidth: 5 }, { top: -2, right: -2, borderTopWidth: 5, borderRightWidth: 5 },
@@ -386,13 +637,14 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
                 .map((p, i) => <View key={i} style={[{ position: 'absolute', width: 34, height: 34, borderColor: '#22c55e' }, p]} />)}
             </View>
           ) : null}
-          {phase === 'busy' ? <View style={s.busy}><ActivityIndicator size="large" color="#fff" /><Text style={s.busyT}>Reading the sheet...</Text></View> : null}
+          {auto && phase !== 'busy' ? <View pointerEvents="none" style={{ position: 'absolute', top: 8, alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.65)', paddingHorizontal: 14, paddingVertical: 6, borderRadius: 14 }}><Text style={{ color: '#fff' }}>{status || 'Looking for a sheet...'}</Text></View> : null}
+          {phase === 'busy' ? <View pointerEvents="none" style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 20, elevation: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.35)' }}><View style={{ backgroundColor: 'rgba(0,0,0,0.75)', paddingHorizontal: 28, paddingVertical: 22, borderRadius: 18, alignItems: 'center' }}><ActivityIndicator size="large" color="#fff" /><Text style={[s.busyT, { marginTop: 12 }]}>Reading the sheet...</Text></View></View> : null}
         </View>
       ) : (
         <View style={[s.cv, s.center, { flex: 1 }]}><Text style={[s.sub, { marginBottom: 12, textAlign: 'center' }]}>Camera permission is needed to scan papers.</Text>
           <Btn s={s} label="Allow camera" onPress={ask} style={{ marginTop: 0 }} /></View>
       )}
-      <Text onLongPress={exportPerf} style={[s.sub, { marginTop: 8, textAlign: 'left' }]}>Fit the whole sheet inside the green corners. It does not need to be straight, the app straightens the page itself. Keep it flat and well lit.</Text>
+      <Text onLongPress={exportPerf} style={[s.sub, { marginTop: 8, textAlign: 'left' }]}>Fit the whole sheet inside the green corners. Tap Capture and grade when the sheet is in view. It does not need to be straight. Keep it flat and well lit.</Text>
       {err ? <Text style={[s.sub, { color: c.red, textAlign: 'left', marginTop: 4 }]}>{err}</Text> : null}
       {note ? <Text style={[s.sub, { color: c.green, textAlign: 'left', marginTop: 4 }]}>{note}</Text> : null}
       <Btn s={s} label="Capture and grade" onPress={snap} disabled={phase === 'busy' || !(perm && perm.granted)} />
@@ -415,14 +667,14 @@ function itemStats(z) {
   const n = z.res.length; if (!n) return [];
   const tot = z.res.map((r) => scoreOf(z, r)); const mt = tot.reduce((x, y) => x + y, 0) / n;
   return z.key.map((k, qi) => {
-    const right = LET[k]; const counts = {}; const hit = [];
-    z.res.forEach((r) => { const m = r.ans[qi] || '-'; counts[m] = (counts[m] || 0) + 1; hit.push(m === right ? 1 : 0); });
+    const rights = keyLets(k); const counts = {}; const hit = [];
+    z.res.forEach((r) => { const m = r.ans[qi] || '-'; counts[m] = (counts[m] || 0) + 1; hit.push(rights.includes(m) ? 1 : 0); });
     const ok = hit.reduce((x, y) => x + y, 0); const mx = ok / n;
     let sxy = 0; let sxx = 0; let syy = 0;
     hit.forEach((x, i) => { const dx = x - mx; const dy = tot[i] - mt; sxy += dx * dy; sxx += dx * dx; syy += dy * dy; });
     const df = sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : 0;
-    if (right && counts[right] === undefined) counts[right] = 0;
-    const cols = Object.keys(counts).map((l) => ({ l, n: counts[l], right: l === right })).sort((x, y) => y.n - x.n || (x.l < y.l ? -1 : 1));
+    rights.forEach((r) => { if (counts[r] === undefined) counts[r] = 0; });
+    const cols = Object.keys(counts).map((l) => ({ l, n: counts[l], right: rights.includes(l) })).sort((x, y) => y.n - x.n || (x.l < y.l ? -1 : 1));
     return { q: qi + 1, pct: Math.round((ok / n) * 100), cols, df };
   });
 }
@@ -453,10 +705,10 @@ function PaperView({ c, z, paper }) {
       borderRadius: 999, borderWidth: thin ? 1.5 : 2.5, borderColor: color }} />);
   };
   for (let i = 0; i < z.f; i++) {
-    const m = paper.ans[i]; const right = LET[z.key[i]]; const q = i + 1;
-    if (m === right) ring('r' + q, q, right, c.green);
-    else if (LET.includes(m)) { ring('x' + q, q, m, c.red); ring('r' + q, q, right, c.green, true); }
-    else ring('x' + q, q, right, c.red);
+    const m = paper.ans[i]; const rights = keyLets(z.key[i]); const q = i + 1;
+    if (rights.includes(m)) ring('r' + q, q, m, c.green);
+    else if (LET.includes(m)) { ring('x' + q, q, m, c.red); rights.forEach((r) => ring('r' + q + r, q, r, c.green, true)); }
+    else rights.forEach((r) => ring('x' + q + r, q, r, c.red));
   }
   return (
     <View style={{ borderWidth: 1.5, borderColor: c.mute, marginTop: 8 }}>
@@ -563,10 +815,10 @@ function paperRings(c, z, paper) {
   lay.answers.bubbles.forEach((b) => { (pos[b.q] = pos[b.q] || {})[b.choice] = b; });
   const at = (q, ch, color, thin) => { const b = pos[q] && pos[q][ch]; if (b) out.push({ x: b.x, y: b.y, color, thin }); };
   for (let i = 0; i < z.f; i++) {
-    const m = paper.ans[i]; const right = LET[z.key[i]]; const q = i + 1;
-    if (m === right) at(q, right, c.green);
-    else if (LET.includes(m)) { at(q, m, c.red); at(q, right, c.green, true); }
-    else at(q, right, c.red);
+    const m = paper.ans[i]; const rights = keyLets(z.key[i]); const q = i + 1;
+    if (rights.includes(m)) at(q, m, c.green);
+    else if (LET.includes(m)) { at(q, m, c.red); rights.forEach((r) => at(q, r, c.green, true)); }
+    else rights.forEach((r) => at(q, r, c.red));
   }
   return { rings: out, R, page: lay.page };
 }
@@ -1479,7 +1731,11 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
   const setRecSlot = (quizId, slot) => upd((d) => { byId(d.quizzes, quizId).rec = slot; return d; });
   const addToClass = (classId, sid) => upd((d) => { const cl = byId(d.classes, classId); if (cl && !cl.s.includes(sid)) cl.s.push(sid); return d; });
   const setQuizClasses = (quizId, ids) => upd((d) => { byId(d.quizzes, quizId).c = ids; return d; });
-  const setKey = (qi, ci) => upd((d) => { byId(d.quizzes, det.id).key[qi] = ci; return d; });
+  // Tap a choice to add it to the key, tap it again to remove it. One choice is stored as a plain number (same as before).
+  const setKey = (qi, ci) => upd((d) => {
+    const key = byId(d.quizzes, det.id).key; const cur = keyList(key[qi]);
+    const next = cur.includes(ci) ? cur.filter((x) => x !== ci) : [...cur, ci].sort((x, y) => x - y);
+    key[qi] = next.length === 0 ? -1 : next.length === 1 ? next[0] : next; return d; });
   const addStudent = (n) => {
     if (!checkStudent(students, '', n)) return false;
     upd((d) => { const id = freshId(d); d.students.push({ id, name: n }); byId(d.classes, det.id).s.push(id); return d; });
@@ -1522,7 +1778,7 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
       const to = (nv, extra) => setDet({ k: 'quiz', id: z.id, v: nv, ...extra });
       const bk = (label, fn) => <Pressable onPress={fn}><Text style={s.back}>{'\u2190'} {label}</Text></Pressable>;
       const sorted = z.res.slice().sort((x, y) => x.name.localeCompare(y.name));
-      const keySet = z.key.filter((k) => k >= 0).length;
+      const keySet = z.key.filter((k) => keyList(k).length > 0).length;
       const pctOf = (r) => Math.round((scoreOf(z, r) / z.f) * 100);
       const named = (r) => !!r.name && r.name !== 'Unnamed paper' && !/^ID \d+$/.test(r.name);
       const prow = (r) => {
@@ -1540,12 +1796,18 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
         );
       };
 
+      if (v === 'qr') {
+        return <View>{bk('Quiz menu', () => to('menu'))}<Text style={s.h1}>Quiz QR code</Text>
+          <Text style={s.sub2}>Print this code and stick it on the blank header area of every answer sheet for this quiz (not over the side stripes or the bubbles). When the scanner sees it, it opens "{z.n}" by itself.</Text>
+          <View style={{ alignItems: 'center', marginVertical: 16 }}><QrView text={'GG1:' + z.id} size={280} /><Text style={[s.h2, { marginTop: 10 }]}>{z.n}</Text></View></View>;
+      }
       if (v === 'key') {
         return <View>{bk('Quiz menu', () => to('menu'))}<Text style={s.h1}>Edit Key</Text>
-          <Text style={s.sub2}>Tap the correct answer for each question. {keySet}/{z.f} set.</Text>
+          <Text style={s.sub2}>Tap the correct answer(s) for each question. You can select more than one, and tap again to unselect. {keySet}/{z.f} set.</Text>
+          <Btn s={s} label="Scan a reference sheet" onPress={() => setModal('keyscan')} style={{ marginBottom: 16 }} />
           <View style={s.list}>{z.key.map((a2, qi) => (
             <View key={qi} style={s.kr}><Text style={s.kn}>{qi + 1}</Text>
-              {optsOf(z).map((l, ci) => <Pressable key={l} onPress={() => setKey(qi, ci)} style={[s.kb, a2 === ci && s.kbOn]}><Text style={[s.txt, a2 === ci && { color: c.bg }]}>{showL(z, l)}</Text></Pressable>)}
+              {optsOf(z).map((l, ci) => <Pressable key={l} onPress={() => setKey(qi, ci)} style={[s.kb, keyList(a2).includes(ci) && s.kbOn]}><Text style={[s.txt, keyList(a2).includes(ci) && { color: c.bg }]}>{showL(z, l)}</Text></Pressable>)}
             </View>))}</View></View>;
       }
       if (v === 'review') {
@@ -1643,6 +1905,7 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
         ) : <Text style={s.empty}>No papers scanned yet. Statistics appear after you scan.</Text>}
         {keySet < z.f ? <Text style={[s.sub2, { color: c.red, marginTop: 12 }]}>The answer key is not complete. Tap Edit Key first.</Text> : null}
         <MenuBtn s={s} c={c} icon="key-outline" label="Edit Key" onPress={() => to('key')} />
+        <MenuBtn s={s} c={c} icon="qr-code-outline" label="Quiz QR code" onPress={() => to('qr')} />
         <MenuBtn s={s} c={c} icon="camera-outline" label="Scan Papers" onPress={() => openScan(z.id)} />
         <MenuBtn s={s} c={c} icon="document-text-outline" label="Review Papers" onPress={() => to('review')} />
         <MenuBtn s={s} c={c} icon="bar-chart-outline" label="Item Analysis" onPress={() => to('item')} />
@@ -1696,7 +1959,7 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
     }
     if (det && det.k === 'page') {
       const p = det.p; let inner;
-      if (p === 'FAQ') inner = <View style={s.list}>{[['How do I grade a paper?', 'Open Scan from the camera button, choose a quiz, and capture the filled answer sheet.'],
+      if (p === 'FAQ') inner = <View style={s.list}>{[['How do I grade a paper?', 'Open Scan from the camera button and hold the filled answer sheet in view. With Auto-scan on, it reads and saves the sheet by itself.'],
         ['Where do I set the answer key?', 'Open a quiz from Home and tap the correct answer for each question.'],
         ['What ID do students fill in?', 'Each student has an ID number shown in their class. They fill it in the ID grid.'],
         ['Where are scores saved?', 'Each quiz has a spreadsheet with one row per student, under Spreadsheet.']].map((x) => <View key={x[0]} style={s.li2}><Text style={s.qq}>{x[0]}</Text><Text style={s.sub2}>{x[1]}</Text></View>)}</View>;
@@ -1730,6 +1993,16 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
       {tab === 'classes' && ctab === 'students' ? null : tab === 'recent' ? <View style={s.list}>{log.filter((e) => m(e.t)).length ? log.filter((e) => m(e.t)).map((e, i) => <Row key={i} a={e.t} b={e.d} />) : <Text style={s.empty}>No recent activity.</Text>}</View>
         : items.length ? <View style={s.grid}>{items}</View> : tab === 'sheet' && stab === 'ecr' ? <Text style={s.empty}>Create a class on the Classes tab first.</Text> : empty}</View>;
   };
+
+  if (modal === 'keyscan') {
+    const kz = det && quizzes.find((x) => x.id === det.id);
+    return (
+      <View style={s.root}>
+        <StatusBar barStyle={scheme === 'dark' ? 'light-content' : 'dark-content'} />
+        {kz ? <KeyScanModal s={s} c={c} z={kz} onUse={(key) => { upd((d) => { byId(d.quizzes, kz.id).key = key; return d; }); setModal(null); }} onClose={() => setModal(null)} /> : null}
+      </View>
+    );
+  }
 
   if (modal === 'scan') {
     return (
