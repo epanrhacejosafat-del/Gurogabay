@@ -616,7 +616,7 @@ function run(norm, raw, w, h, layouts) {
     const fr = [];
     for (let d = 0; d < 10; d++) fr.push(probe(id.x0 + j * id.pitchX, id.y0 + d * id.pitchY, id.radius).fill);
     const lvl = Math.min(pct(fr, 0.5), empty + 0.08), r = pick(fr.map((v) => v - lvl));
-    if (r.st === 'ok') studentId += r.on[0]; else if (r.st !== 'blank') studentId += '?';
+    if (r.st === 'ok') studentId += r.on[0]; else if (r.st === 'faint') studentId += r.best; else if (r.st !== 'blank') studentId += '?'; // a light single mark still counts as a digit
   }
   // Where the sheet sits in the photo (corners as 0..1 of the photo, in sheet order) and how sharp it is. Auto-scan uses this to wait for a good picture.
   const [PW, PH] = lay.page;

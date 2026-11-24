@@ -8,7 +8,7 @@ import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { Ionicons } from '@expo/vector-icons';
 import qrcode from 'qrcode-generator';
 import { readPhoto, fromBase64, rgbaToGray, ScanError } from './src/omr';
-import LAYOUTS from './src/layouts';
+import { buildLayout, PAGE } from './src/layouts';
 import { TRACKS, NCOL, termCalc, finalCalc, individualScores, mpsSummary, LEVELS, csv as toCsv, quizSections, individualCsvRows, mpsCsvRows, TOS_LEVELS, MASTERY, parseItems, itemsText, tosCheck, competencyStats, tosCsvRows, competencyCsvRows } from './src/records';
 import * as FS from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
@@ -51,9 +51,10 @@ const SCAN_PX_RETRY = 1800; // if the sheet cannot be found at SCAN_PX, the same
 const AUTO_OK = ['faint', 'cross', 'stray'];
 const A4 = 595 / 842;
 const LET = ['A', 'B', 'C', 'D', 'E'];
-// The scanner reads three printed sheet forms. A quiz of any size from 1 to 100 uses the smallest form that fits it.
-const FORMS = [30, 60, 100];
-const formOf = (z) => FORMS.find((n) => n >= z.f) || 100;
+// The scan layout is built from the quiz itself (items and choices), the same way the website's Sheet Editor prints the sheet.
+const formOf = (z) => z.f;
+const LAY_CACHE = {};
+const layoutOf = (z) => { const k = z.f + ':' + (CHOICE_N[z.ch] || 5); return LAY_CACHE[k] || (LAY_CACHE[k] = buildLayout(z.f, CHOICE_N[z.ch] || 5)); };
 const CHOICE_NAMES = { AB: 'A – B', AC: 'A – C', AD: 'A – D', AE: 'A – E', TF: 'True / False' };
 const CHOICE_N = { AB: 2, AC: 3, AD: 4, AE: 5, TF: 2 };
 const optsOf = (z) => LET.slice(0, CHOICE_N[z.ch] || 5);
@@ -151,7 +152,7 @@ function QuizForm({ s, c, classes, quizzes, onSave, onCancel }) {
           onBlur={() => setFText(String(f))} />
         <Text style={s.lab}>Choices:</Text>
         <View style={s.chips}>{Object.keys(CHOICE_NAMES).map((k) => <Chip key={k} s={s} label={CHOICE_NAMES[k]} on={ch === k} onPress={() => setCh(k)} />)}</View>
-        <Text style={s.sub2}>Print the {formOf({ f })}-question answer sheet for this quiz.{ch === 'TF' ? ' For true or false, students shade A for True and B for False.' : ''}</Text>
+        <Text style={s.sub2}>Print the answer sheet from the website Sheet Editor with {f} items and choices {CHOICE_NAMES[ch]}.{ch === 'TF' ? ' For true or false, students shade A for True and B for False.' : ''}</Text>
         <Text style={s.lab}>Classes:</Text>
         <View style={s.chips}>
           {classes.length ? classes.map((x) => <Chip key={x.id} s={s} label={x.n} on={picked.includes(x.id)} onPress={() => tog(x.id)} />)
@@ -250,7 +251,7 @@ function checkFrame(st, out, loose) {
 }
 
 // Takes a photo and reads it. big = also try the larger size when the sheet is not found. quiet = no debug picture on failure.
-async function grabSheet(cam, f, form, big, quiet) {
+async function grabSheet(cam, f, lay, big, quiet) {
   const pic = await timed('1_capture', () => cam.current.takePictureAsync({ quality: 0.6, skipProcessing: true, shutterSound: false }));
   // Read at the normal size first (fast). If the sheet is not found, try the same photo once more at a larger size before giving up.
   const readAt = async (pxs) => {
@@ -261,7 +262,7 @@ async function grabSheet(cam, f, form, big, quiet) {
       const buf = await (await fetch(small.uri)).arrayBuffer();
       return jpeg.decode(new Uint8Array(buf), { useTArray: true });
     });
-    return timedSync('4_omr_read', () => readPhoto(rgbaToGray(raw.data, raw.width, raw.height), raw.width, raw.height, LAYOUTS, quiet), 'items=' + f);
+    return timedSync('4_omr_read', () => readPhoto(rgbaToGray(raw.data, raw.width, raw.height), raw.width, raw.height, { [f]: lay }, quiet), 'items=' + f);
   };
   let out;
   try { out = await readAt(SCAN_PX); }
@@ -269,8 +270,7 @@ async function grabSheet(cam, f, form, big, quiet) {
     if (!big || !(e instanceof ScanError) || Math.max(pic.width, pic.height) <= SCAN_PX * 1.15) throw e;
     out = await readAt(SCAN_PX_RETRY);
   }
-  if (out.n !== form) { const mm = new ScanError(`This is a ${out.n}-question sheet, but this quiz needs the ${form}-question sheet.`); mm.mismatch = true; throw mm; }
-  if (out.answers.length > f) out.answers = out.answers.slice(0, f);
+    if (out.answers.length > f) out.answers = out.answers.slice(0, f);
   return out;
 }
 const notFoundHint = (e) => (/outside the photo/.test((e && e.message) || '') ? 'Move back so the whole sheet is in view.' : 'Fit the whole sheet inside the green corners.');
@@ -321,7 +321,7 @@ function KeyScanModal({ s, c, z, onUse, onClose }) {
     if (working) return;
     setWorking(true); setErr(''); setDbg(null);
     try {
-      const out = await grabSheet(cam, z.f, formOf(z), true, false);
+      const out = await grabSheet(cam, z.f, layoutOf(z), true, false);
       setFound(makeKey(out));
     } catch (e) {
       console.log('key scan error', e);
@@ -332,7 +332,7 @@ function KeyScanModal({ s, c, z, onUse, onClose }) {
   const redo = () => { setFound(null); setErr(''); setDbg(null); };
 
   if (found) {
-    const lay = LAYOUTS[formOf(z)]; const [PW, PH] = lay.page; const R = lay.answers.radius * 1.3;
+    const lay = layoutOf(z); const [PW, PH] = lay.page; const R = lay.answers.radius * 1.3;
     const pos = {}; lay.answers.bubbles.forEach((b) => { (pos[b.q] = pos[b.q] || {})[b.choice] = b; });
     const rings = [];
     found.key.forEach((k, i) => { keyLets(k).forEach((l) => { const b = pos[found.qs[i]] && pos[found.qs[i]][l]; if (b) rings.push({ x: b.x, y: b.y }); }); });
@@ -441,7 +441,7 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
   }, [phase]);
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const grab = (zq, big, quiet) => grabSheet(cam, zq.f, formOf(zq), big, quiet);
+  const grab = (zq, big, quiet) => grabSheet(cam, zq.f, layoutOf(zq), big, quiet);
   const show = (out) => {
     const auto2 = {}; out.answers.forEach((x) => { if (AUTO_OK.includes(x.status) && x.suggest) auto2[x.q] = x.suggest; });
     setRes(out); setFix(auto2); setNameText('');
@@ -530,7 +530,7 @@ function ScanModal({ s, c, quizzes, students, classes, initial, onSave, onClose 
     const letters = res.answers.map((a2) => (a2.status === 'ok' ? a2.choice[0] : fix[a2.q] ? (fix[a2.q] === 'X' ? '-' : fix[a2.q]) : a2.status === 'multiple' ? '?' : '-'));
     const score = letters.filter((l, i) => keyLets(z.key[i]).includes(l)).length;
     const finalId = idText.trim(); const reg = students.find((st) => st.id === finalId) || null;
-    const lay = LAYOUTS[formOf(z)]; const [PW, PH] = lay.page; const R = lay.answers.radius * 1.3;
+    const lay = layoutOf(z); const [PW, PH] = lay.page; const R = lay.answers.radius * 1.3;
     const pos = {}; lay.answers.bubbles.forEach((b) => { (pos[b.q] = pos[b.q] || {})[b.choice] = b; });
     const rings = [];
     res.answers.forEach((ans, i) => {
@@ -687,7 +687,7 @@ function MenuBtn({ s, c, icon, label, onPress }) {
 // green ring = correct answer, red ring = wrong or missed.
 function PaperView({ c, z, paper }) {
   const [W, setW] = useState(0);
-  const lay = LAYOUTS[formOf(z)]; const [PW, PH] = lay.page; const R = lay.answers.radius; const sc = W / PW;
+  const lay = layoutOf(z); const [PW, PH] = lay.page; const R = lay.answers.radius; const sc = W / PW;
   const pos = {}; lay.answers.bubbles.forEach((b) => { (pos[b.q] = pos[b.q] || {})[b.choice] = b; });
   const els = [];
   lay.answers.bubbles.forEach((b) => {
@@ -802,7 +802,7 @@ function useScan(k, uri) {
 function ScanStrip({ k, uri, style, fallback }) {
   const src = useScan(k, uri);
   if (!src) return fallback || null;
-  const [PW, PH] = LAYOUTS[30].page; const bw = STRIP.x1 - STRIP.x0, bh = STRIP.y1 - STRIP.y0;
+  const [PW, PH] = PAGE; const bw = STRIP.x1 - STRIP.x0, bh = STRIP.y1 - STRIP.y0;
   return (
     <View style={[{ width: '100%', aspectRatio: bw / bh, overflow: 'hidden', backgroundColor: '#ffffff', borderRadius: 6, borderWidth: StyleSheet.hairlineWidth, borderColor: '#8a949e' }, style]}>
       <Image source={{ uri: src }} resizeMode="stretch" style={{ position: 'absolute', width: (PW / bw) * 100 + '%', height: (PH / bh) * 100 + '%', left: (-STRIP.x0 / bw) * 100 + '%', top: (-STRIP.y0 / bh) * 100 + '%' }} />
@@ -811,7 +811,7 @@ function ScanStrip({ k, uri, style, fallback }) {
 }
 // Green / red rings for one graded paper, in points on the printed page.
 function paperRings(c, z, paper) {
-  const lay = LAYOUTS[formOf(z)]; const R = lay.answers.radius * 1.3; const pos = {}; const out = [];
+  const lay = layoutOf(z); const R = lay.answers.radius * 1.3; const pos = {}; const out = [];
   lay.answers.bubbles.forEach((b) => { (pos[b.q] = pos[b.q] || {})[b.choice] = b; });
   const at = (q, ch, color, thin) => { const b = pos[q] && pos[q][ch]; if (b) out.push({ x: b.x, y: b.y, color, thin }); };
   for (let i = 0; i < z.f; i++) {
@@ -1884,7 +1884,7 @@ function Main({ acct, onAccount, onLogout, onDelete, scheme, mode, onMode }) {
             <View style={s.list}>
               <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Questions</Text><Text style={s.txt}>{z.f}</Text></View>
               <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Choices</Text><Text style={s.txt}>{CHOICE_NAMES[z.ch] || 'A – E'}</Text></View>
-              <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Answer sheet</Text><Text style={s.txt}>{formOf(z)}-question form</Text></View>
+              <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Answer sheet</Text><Text style={s.txt}>{z.f} items · {CHOICE_NAMES[z.ch] || 'A – E'}</Text></View>
               <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Papers</Text><Text style={s.txt}>{z.res.length}</Text></View>
               <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Answer key</Text><Text style={[s.txt, keySet < z.f && { color: c.red }]}>{keySet}/{z.f} set</Text></View>
               <View style={s.li}><Text style={[s.txt, { flex: 1 }]}>Classes</Text><Text style={[s.txt, { flexShrink: 1, textAlign: 'right' }]}>{cls || 'None'}</Text></View>
